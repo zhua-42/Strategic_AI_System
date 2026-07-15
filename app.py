@@ -9,10 +9,11 @@ from openai import OpenAI
 import streamlit as st
 import plotly.graph_objects as go
 from docx import Document  # 用于生成Word文档
+from docx.shared import Inches  # 用于Word文档中精细调整图表大小
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="数智投研多智能体决策系统", layout="wide")
+st.set_page_config(page_title="数智投研多智能体系统", layout="wide")
 
 load_dotenv()
 api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -141,7 +142,7 @@ with st.sidebar:
     st.title("🛠 启动投研")
     query = st.text_input("输入调研课题/公司", placeholder="如：新能源汽车")
     submit_btn = st.button("🚀 开启 7-Agent 深度协同")
-    st.caption("提示：结合数据库及真实性验证，需要约1分钟。")
+    st.caption("提示：结合数据库及真实性验证，需要约1~2分钟。:D")
 
 # --- 7. 核心 7-Agent 流水线实现 (解决痛点 10, 16, 17, 18) ---
 def run_research_flow(user_input, log_callback, status_callback):
@@ -316,6 +317,17 @@ with col_main:
                 )
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
+                # --- ✅ 第一处修改：增加饼图单张 PDF 矢量图下载 (依赖 kaleido) ---
+                pdf_buffer_pie = io.BytesIO()
+                fig_pie.write_image(file=pdf_buffer_pie, format="pdf")
+                st.download_button(
+                    label="📊 导出左侧饼图为 PDF 矢量图",
+                    data=pdf_buffer_pie.getvalue(),
+                    file_name="market_share_chart.pdf",
+                    mime="application/pdf",
+                    key="dl_pie"
+                )
+                
             with c2:
                 # 动态杜邦三要素分析图
                 dupont_data = data.get("roe_breakdown", {"categories": ["ROE", "净利率", "资产周转率", "权益乘数"], "values": [12, 10, 6, 2]})
@@ -334,6 +346,17 @@ with col_main:
                 )
                 st.plotly_chart(fig_radar, use_container_width=True)
                 
+                # --- ✅ 第一处修改：增加雷达图单张 PDF 矢量图下载 (依赖 kaleido) ---
+                pdf_buffer_radar = io.BytesIO()
+                fig_radar.write_image(file=pdf_buffer_radar, format="pdf")
+                st.download_button(
+                    label="📈 导出右侧雷达图为 PDF 矢量图",
+                    data=pdf_buffer_radar.getvalue(),
+                    file_name="dupont_chart.pdf",
+                    mime="application/pdf",
+                    key="dl_radar"
+                )
+                
             st.caption(f"🛡️ **真实性校验锚定底表数据源**：{data.get('locked_source', '本地数据库锁定验证')}")
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -342,19 +365,52 @@ with col_main:
         st.markdown(st.session_state['current_report'])
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # C. 导出功能准备 (解决痛点 1)
-        # 为Word导出提供文档生成流
+        # --- ✅ 第二处修改：全面升级 Word 导出逻辑，将动态数据图表直接完美嵌入到文档中 ---
         doc = Document()
-        doc.add_heading(f"{st.session_state['current_query']} 深度研报分析", level=1)
-        doc.add_paragraph(st.session_state['current_report'])
-        
+        doc.add_heading(f"{st.session_state['current_query']} 深度战略研报", level=1)
+        doc.add_paragraph(f"研报生成时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
+        doc.add_paragraph("本报告由 SQLite 本地数据库真实数据锚定，并经由多智能体协同校验输出。")
+        doc.add_paragraph("-" * 50)
+
+        # 插入图表数据
+        doc.add_heading("第一部分：数字化数据看板", level=2)
+        try:
+            colors = ['#1f77b4', '#d62728', '#32a852', '#ff7f0e']
+            share_labels = data.get("market_share", {}).get("labels", ['核心头部', '中坚力量', '初创企业', '其他'])
+            share_values = data.get("market_share", {}).get("values", [45, 25, 15, 15])
+            fig_pie_exp = go.Figure(data=[go.Pie(labels=share_labels, values=share_values, hole=.4, marker=dict(colors=colors))])
+            fig_pie_exp.update_layout(title="市场份额分布预期 (CR4)")
+
+            # 将饼图渲染为内存中的 PNG
+            img_bytes_pie = fig_pie_exp.to_image(format="png", width=600, height=400)
+            
+            doc.add_paragraph("1.1 行业市场竞争格局图：")
+            doc.add_picture(io.BytesIO(img_bytes_pie), width=Inches(5.5))  # 完美嵌入图片
+            doc.add_paragraph(f"数据说明：{data.get('locked_source', '数据校验底表')}")
+        except Exception as e:
+            doc.add_paragraph(f"[图表导出失败: {e}]")
+
+        # 插入报告正文
+        doc.add_heading("第二部分：战略及财务质量深度透视", level=2)
+        report_text = st.session_state['current_report']
+        for paragraph in report_text.split('\n'):
+            if paragraph.strip():
+                if paragraph.startswith("# "):
+                    doc.add_heading(paragraph.replace("# ", ""), level=1)
+                elif paragraph.startswith("## "):
+                    doc.add_heading(paragraph.replace("## ", ""), level=2)
+                elif paragraph.startswith("### "):
+                    doc.add_heading(paragraph.replace("### ", ""), level=3)
+                else:
+                    doc.add_paragraph(paragraph)
+
         bio = io.BytesIO()
         doc.save(bio)
         
         st.download_button(
-            label="📥 导出为标准格式 Word 研报",
+            label="📥 导出完整研报（含数据图表）.docx",
             data=bio.getvalue(),
-            file_name=f"{st.session_state['current_query']}_研报.docx",
+            file_name=f"{st.session_state['current_query']}_深度研报.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
     else:
