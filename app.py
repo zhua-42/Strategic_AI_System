@@ -252,7 +252,7 @@ def run_research_flow(user_input, log_callback, status_callback):
 col_status, col_main, col_logs = st.columns([0.8, 2.5, 1.0])
 
 with col_status:
-    st.markdown("###智能体决策流")
+    st.markdown("### 智能体决策流")
     st.divider()
     for agent in ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]:
         key = f"status_{agent}"
