@@ -252,7 +252,7 @@ def run_research_flow(user_input, log_callback, status_callback):
 col_status, col_main, col_logs = st.columns([0.8, 2.5, 1.0])
 
 with col_status:
-    st.markdown("### 智能体决策流")
+    st.markdown("###智能体决策流")
     st.divider()
     for agent in ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]:
         key = f"status_{agent}"
@@ -360,6 +360,66 @@ with col_main:
             st.caption(f"🛡️ **真实性校验锚定底表数据源**：{data.get('locked_source', '本地数据库锁定验证')}")
             st.markdown('</div>', unsafe_allow_html=True)
 
+        # =========================================================================
+        # 🔗 在这里插入【3D 产业链图】代码 (已为您添加了卡片式容器包装，保持排版精美统一)
+        # =========================================================================
+        with st.container():
+            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+            st.write("#### 🔗 产业链全景逻辑流 (3D交互感)")
+            
+            # 动态解析或使用静态兜底数据
+            if data and "supply_chain" in data and len(data["supply_chain"]) > 0:
+                nodes = [item.get("node", "") for item in data["supply_chain"]]
+                companies = [item.get("companies", "") for item in data["supply_chain"]]
+                details = [item.get("details", "") for item in data["supply_chain"]]
+                x = [item.get("x", idx) for idx, item in enumerate(data["supply_chain"])]
+                y = [item.get("y", 0.0 if idx % 2 == 0 else 0.5) for idx, item in enumerate(data["supply_chain"])]
+                z = [item.get("z", 0.0 if idx % 2 == 0 else 1.0) for idx, item in enumerate(data["supply_chain"])]
+            else:
+                nodes = ['基础材料', '核心零部件', '整机/系统集成', '下游应用', '售后/回收']
+                x = [0, 1, 2, 3, 4]
+                y = [0, 0.5, -0.5, 0.2, 0]
+                z = [0, 1, 0, 1, 0]
+                companies = ['宝钢股份、中复神鹰', '宁德时代、汇川技术', '西门子、大疆、亿航', '顺丰、国家电网', '格林美、各品牌4S']
+                details = ['提供碳纤维、高性能钢材等原始原料', '电机、电池、传感器等核心组件生产', '产品组装、飞控系统及AI算法集成', '物流配送、工业巡检、消费文旅等', '设备维护及资源循环再利用']
+
+            fig_3d = go.Figure(data=[go.Scatter3d(
+                x=x, y=y, z=z,
+                mode='markers+lines+text',
+                marker=dict(size=12, color=['#d62728', '#1f77b4', '#d62728', '#1f77b4', '#333'][:len(nodes)], opacity=0.8),
+                line=dict(color='#1f77b4', width=6),
+                text=nodes,
+                hoverinfo='text',
+                hovertext=[f"环节: {n}<br>业务: {d}<br>代表企业: {c}" for n,d,c in zip(nodes, details, companies)]
+            )])
+            fig_3d.update_layout(
+                height=450, 
+                margin=dict(l=0, r=0, b=0, t=0), 
+                scene=dict(
+                    xaxis_title='流程阶段', 
+                    yaxis_title='价值分布', 
+                    zaxis_title='技术壁垒'
+                )
+            )
+            st.plotly_chart(fig_3d, use_container_width=True)
+            
+            # --- 💡 加分项：为 3D 产业链添加高保真 PDF 矢量图下载按钮 ---
+            pdf_buffer_3d = io.BytesIO()
+            fig_3d.write_image(file=pdf_buffer_3d, format="pdf")
+            st.download_button(
+                label="📊 导出 3D 产业链图为 PDF 矢量图",
+                data=pdf_buffer_3d.getvalue(),
+                file_name="supply_chain_chart.pdf",
+                mime="application/pdf",
+                key="dl_3d"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        # =========================================================================
+
+        # B. 研报正文展示
+        st.markdown('<div class="report-container">', unsafe_allow_html=True)
+        st.markdown(st.session_state['current_report'])
+        st.markdown('</div>', unsafe_allow_html=True)
         # B. 研报正文展示
         st.markdown('<div class="report-container">', unsafe_allow_html=True)
         st.markdown(st.session_state['current_report'])
