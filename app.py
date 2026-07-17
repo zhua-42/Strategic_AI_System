@@ -516,7 +516,7 @@ with col_main:
         st.markdown('</div>', unsafe_allow_html=True)
         # B. 研报正文展示
         st.markdown('<div class="report-container">', unsafe_allow_html=True)
-        st.markdaown(st.session_state['current_report'])
+        st.markdown(st.session_state['current_report'])
         st.markdown('</div>', unsafe_allow_html=True)
 
         # --- ✅ 第二处修改：全面升级 Word 导出逻辑，将动态数据图表直接完美嵌入到文档中 ---
