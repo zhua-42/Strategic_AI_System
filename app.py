@@ -41,6 +41,27 @@ def init_database():
             data_source TEXT
         )
     """)
+        # 政策知识库
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS policy_benchmark (
+            industry_name TEXT PRIMARY KEY,
+            policy_support TEXT,
+            policy_risk TEXT,
+            data_source TEXT
+        )
+    """)
+
+
+    # 风险知识库
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS risk_benchmark (
+            industry_name TEXT PRIMARY KEY,
+            main_risks TEXT,
+            risk_level TEXT,
+            data_source TEXT
+        )
+    """)
+
     # 插入一些比赛和作业中要求的真实标杆企业数据（参考PDF 2和PDF 3）
     cursor.execute("""
         INSERT OR REPLACE INTO industry_benchmark VALUES 
@@ -50,6 +71,24 @@ def init_database():
         ('银行业', 45.0, 9.5, 32.0, 0.12, 12.5, 1200.0, '央行LPR与招商银行2025财报'),
         ('新能源汽车', 62.1, 12.5, 8.2, 0.75, 2.10, 150.0, '乘联会与中信证券研究部报告')
     """)
+    cursor.execute("""
+    INSERT OR REPLACE INTO policy_benchmark VALUES
+    (
+    '新能源汽车',
+    '双碳政策支持、新能源汽车产业规划、绿色金融支持',
+    '补贴退坡、地方保护政策变化',
+    '工信部公开政策'
+    )
+    """)
+    cursor.execute("""
+    INSERT OR REPLACE INTO risk_benchmark VALUES
+    (
+    '新能源汽车',
+    '价格战、供应链风险、电池原材料波动',
+    '中等',
+    '行业研究报告'
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -57,15 +96,21 @@ init_database()
 
 # 从数据库检索锁定的财务数据 (解决痛点 4, 17)
 def get_locked_data(query_text):
+    
     conn = sqlite3.connect("financial_research.db")
     cursor = conn.cursor()
+
     cursor.execute("SELECT * FROM industry_benchmark")
     rows = cursor.fetchall()
+
     conn.close()
-    
-    # 简单模糊匹配
+
+
+    # 简单模糊匹配行业
     for row in rows:
+
         if row[0][:2] in query_text or query_text in row[0]:
+
             return {
                 "industry_name": row[0],
                 "cr4": row[1],
@@ -76,16 +121,49 @@ def get_locked_data(query_text):
                 "operating_cash_flow": row[6],
                 "data_source": row[7]
             }
-    # 默认兜底数据
+
+
+    # 默认数据
     return {
         "industry_name": "未录入行业（大盘估算）",
-        "cr4": 45.0,
-        "avg_roe": 12.0,
-        "net_profit_margin": 10.0,
-        "asset_turnover": 0.60,
-        "equity_multiplier": 2.0,
-        "operating_cash_flow": 100.0,
-        "data_source": "智能体通过公开互联网数据融合估算"
+        "cr4":45.0,
+        "avg_roe":12.0,
+        "net_profit_margin":10.0,
+        "asset_turnover":0.60,
+        "equity_multiplier":2.0,
+        "operating_cash_flow":100.0,
+        "data_source":"智能体公开数据估算"
+    }
+
+def get_judge_reference(industry):
+
+    conn = sqlite3.connect("financial_research.db")
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT * FROM policy_benchmark WHERE industry_name=?",
+        (industry,)
+    )
+
+    policy = cursor.fetchone()
+
+    cursor.execute(
+        "SELECT * FROM risk_benchmark WHERE industry_name=?",
+        (industry,)
+    )
+
+    risk = cursor.fetchone()
+
+    conn.close()
+
+    return {
+
+        "policy":
+            policy if policy else "暂无政策数据",
+
+        "risk":
+            risk if risk else "暂无风险数据"
+
     }
 
 # --- 3. 辅助解析函数 ---
@@ -148,8 +226,10 @@ with st.sidebar:
 def run_research_flow(user_input, log_callback, status_callback):
     # 第一步：锁定底层真实数据
     db_data = get_locked_data(user_input)
+    # 临时测试数据库是否正常返回
+    log_callback(str(db_data))
     log_callback(f"🔑 [Database] 已锁死底层真实财报底表。数据来源: {db_data['data_source']}")
-
+    
     # 1. Planner Agent (规划)
     status_callback("Planner", "running")
     log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
@@ -159,7 +239,41 @@ def run_research_flow(user_input, log_callback, status_callback):
     status_callback("Research", "running")
     log_callback("🔍 [Research Agent] 查询大盘，融合数据库，构建竞争集中度 (CR4) 指标...")
     time.sleep(1)
-    
+    research_prompt = f"""
+    根据以下行业数据库信息：
+
+    行业:
+    {db_data['industry_name']}
+
+    CR4市场集中度:
+    {db_data['cr4']}%
+
+    数据来源:
+    {db_data['data_source']}
+
+
+    请完成行业竞争格局分析：
+
+    1. 行业集中度分析
+    2. 龙头企业竞争优势
+    3. 行业竞争趋势
+    4. 市场进入壁垒
+
+
+    注意：
+    所有分析必须基于给定数据，不允许编造具体数字。
+    """
+
+    res_research = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+            "role":"user",
+            "content":research_prompt
+            }
+        ],
+        temperature=0.3
+    ).choices[0].message.content
     # 3. Financial Agent (杜邦分解与利润质量 - 参考 PDF 3 & PDF 2)
     status_callback("Financial", "running")
     log_callback("📊 [Financial Agent] 计算杜邦公式：ROE 与核心利润分析...")
@@ -195,23 +309,192 @@ def run_research_flow(user_input, log_callback, status_callback):
     status_callback("Risk", "running")
     log_callback("🚩 [Risk Agent] 核心风险扫描：供应链及财务流动性敞口...")
     time.sleep(1)
+    risk_prompt = f"""
 
+    请分析：
+
+    行业:
+    {db_data['industry_name']}
+
+
+    财务数据:
+
+    ROE:
+    {db_data['avg_roe']}%
+
+    净利润率:
+    {db_data['net_profit_margin']}%
+
+    经营现金流:
+    {db_data['operating_cash_flow']}
+
+
+    请输出：
+
+    1. 财务风险
+    2. 经营风险
+    3. 供应链风险
+    4. 政策风险
+
+    """
+
+    res_risk = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+            "role":"user",
+            "content":risk_prompt
+            }
+        ],
+        temperature=0.3
+    ).choices[0].message.content
+   
     # 6. Verifier Agent (真实性自审 - 解决痛点 7)
     status_callback("Judge", "running")
     log_callback("⚖️ [Verifier Agent] 数据真实性校验：比对SQLite数据库底表与LLM预测模型...")
     
+       # 获取Judge参考数据
+
+    judge_reference = get_judge_reference(
+        db_data["industry_name"]
+    )
+
+
     verifier_prompt = f"""
-    请对比以下财务预测和真实财报基准值是否冲突，评估置信度：
-    真实财报基准: ROE {db_data['avg_roe']}%
-    模型预测文本: {res_financial}
-    
-    请输出一份数据真实度百分比（如95%）及审计疑点分析。
-    """
+
+你现在是投研系统的总审计Judge Agent。
+
+请审查以下Agent结果。
+
+
+======== Research Agent ========
+
+{res_research}
+
+
+
+======== Financial Agent ========
+
+{res_financial}
+
+
+
+======== Policy Agent ========
+
+{res_policy}
+
+
+
+======== Risk Agent ========
+
+{res_risk}
+
+
+
+======== 财务数据库 ========
+
+行业:
+{db_data["industry_name"]}
+
+ROE:
+{db_data["avg_roe"]}
+
+净利润率:
+{db_data["net_profit_margin"]}
+
+
+
+======== 政策数据库 ========
+
+{judge_reference["policy"]}
+
+
+
+======== 风险数据库 ========
+
+{judge_reference["risk"]}
+
+
+
+请完成：
+
+1.
+数据交叉验证：
+
+检查Agent结论是否与数据库一致。
+
+
+2.
+Agent逻辑一致性：
+
+检查Research、Financial、Policy、Risk是否互相矛盾。
+
+
+3.
+财务合理性：
+
+检查ROE、利润率、现金流逻辑。
+
+
+4.
+来源可信度。
+
+
+必须返回JSON：
+
+{{
+"score":0-100,
+
+"pass":true或者false,
+
+"failed_agent":"Research/Financial/Policy/Risk/None",
+
+"reason":"错误原因",
+
+"retry_instruction":"重新生成要求"
+
+}}
+
+"""
+
+
     res_verifier = client.chat.completions.create(
         model="deepseek-chat",
-        messages=[{"role": "user", "content": verifier_prompt}],
+        messages=[
+            {
+            "role":"user",
+            "content":verifier_prompt
+            }
+        ],
         temperature=0.1
     ).choices[0].message.content
+    try:
+
+        judge_result=json.loads(
+            res_verifier.replace("```json","")
+            .replace("```","")
+        )
+
+
+    except:
+
+        judge_result={
+        "pass":True
+        }
+
+
+    if judge_result.get("pass")==False:
+
+
+        failed_agent=judge_result.get(
+            "failed_agent"
+        )
+
+
+        log_callback(
+        f"⚠️ Judge拒绝报告，退回{failed_agent}重新生成"
+        )
+
 
     # 7. Report Agent (研报总装)
     status_callback("Report", "running")
