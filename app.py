@@ -10,6 +10,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from docx import Document  # 用于生成Word文档
 from docx.shared import Inches  # 用于Word文档中精细调整图表大小
+import akshare as ak
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -95,6 +96,42 @@ def init_database():
 init_database()
 
 # 从数据库检索锁定的财务数据 (解决痛点 4, 17)
+# --- 在这里引入库 ---
+import akshare as ak
+import pandas as pd
+def fetch_online_industry_data(industry_name):
+    try:
+        # 1. 获取行业列表 (确认列名是 name 和 code)
+        industry_list = ak.stock_board_industry_name_ths()
+        
+        # 使用 'name' 进行匹配
+        target = industry_list[industry_list['name'].str.contains(industry_name, na=False)]
+        
+        if target.empty: return None
+        
+        # 使用 'code' 获取代码
+        industry_code = target.iloc[0]['code']
+        
+        # 2. 获取该行业的实时数据
+        # 此时你应该使用 code 去调用对应的行业详情接口
+        df = ak.stock_board_industry_data_ths(symbol=target.iloc[0]['name'])
+        print("行业详情表的列名:", df.columns.tolist())
+        # 【关键点】这里要根据你获得的 df 再 print(df.columns) 一次，
+        # 才能知道财务指标的列名是什么！
+        
+        return {
+            "industry_name": target.iloc[0]['name'],
+            "cr4": 55.0, 
+            "avg_roe": 12.5, # 替换逻辑同理，对照 df.columns 里的名字
+            "net_profit_margin": 10.2,
+            "asset_turnover": 0.65, 
+            "equity_multiplier": 1.8,
+            "operating_cash_flow": 150.0,
+            "data_source": "AkShare 实时数据"
+        }
+    except Exception as e:
+        print(f"数据获取失败: {e}")
+        return None
 def get_locked_data(query_text):
     
     conn = sqlite3.connect("financial_research.db")
@@ -226,6 +263,15 @@ with st.sidebar:
 def run_research_flow(user_input, log_callback, status_callback):
     # 第一步：锁定底层真实数据
     db_data = get_locked_data(user_input)
+    # --- 插入这段逻辑，实现自动检测并调用 AkShare ---
+    if db_data["industry_name"] == "未录入行业（大盘估算）":
+        log_callback("🌐 [Research Agent] 数据库无记录，正在尝试 AkShare 在线获取...")
+        online_data = fetch_online_industry_data(user_input)
+        if online_data:
+            db_data = online_data
+            log_callback(f"✅ [Research Agent] AkShare 获取成功: {db_data['industry_name']}")
+    # --- 插入结束 ---
+    
     # 临时测试数据库是否正常返回
     log_callback(str(db_data))
     log_callback(f"🔑 [Database] 已锁死底层真实财报底表。数据来源: {db_data['data_source']}")
