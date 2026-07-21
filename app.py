@@ -115,7 +115,9 @@ def fetch_online_industry_data(industry_name):
         # 2. 获取该行业的实时数据
         # 此时你应该使用 code 去调用对应的行业详情接口
         df = ak.stock_board_industry_data_ths(symbol=target.iloc[0]['name'])
-        print("行业详情表的列名:", df.columns.tolist())
+       # --- 这一行代码会直接把列名显示在网页上！---
+        st.error(f"当前获取的列名: {df.columns.tolist()}") 
+        # ------------------------------------------
         # 【关键点】这里要根据你获得的 df 再 print(df.columns) 一次，
         # 才能知道财务指标的列名是什么！
         
