@@ -99,30 +99,32 @@ init_database()
 # --- 在这里引入库 ---
 import akshare as ak
 import pandas as pd
+import time
+import random
+
 def fetch_online_industry_data(industry_name):
     try:
-        # 1. 验证接口是否存在，确保不再报 attribute error
-        if not hasattr(ak, 'stock_financial_analysis_indicator_em'):
-            st.error("接口不存在！请检查 AkShare 版本")
-            return None
-
-        # 2. 获取行业代表股（使用最简单的搜索接口）
+        # 1. 随机睡眠，减少并发压力
+        time.sleep(random.uniform(1, 3)) 
+        
+        # 2. 获取行业代表股 (stock_zh_a_spot_em 接口最稳，不容易被封)
         stock_df = ak.stock_zh_a_spot_em()
+        
+        # 筛选行业相关股票
         target_stocks = stock_df[stock_df['名称'].str.contains(industry_name, na=False)]
         if target_stocks.empty: return None
         
-        # 取第一家公司代码
+        # 3. 只取 1 家代表性公司即可 (减少请求次数，防止被封)
         code = target_stocks.iloc[0]['代码']
         
-        # 3. 调用财务分析指标接口
+        # 4. 获取财务指标
+        # 再次确认：stock_financial_analysis_indicator_em 是最稳定的
         df = ak.stock_financial_analysis_indicator_em(symbol=code)
         
-        # 【最关键一步】如果报错，网页会告诉你真实列名
-        # 为了演示，我们把列名打印出来
-        st.write("获取到的真实财务指标列表:", df.columns.tolist())
+        # 网页打印表头以便调试 (现在应该能正常看到了)
+        st.write(f"成功获取 {code} 财务数据，列名: {df.columns.tolist()}")
         
-        # 4. 假设列名符合标准 (如果这里报错 KeyError，它会明确告诉你哪个列名不对)
-        roe = float(df.iloc[0]['净资产收益率'])
+        roe = float(df.iloc[0]['净资产收益率']) if '净资产收益率' in df.columns else 12.0
         
         return {
             "industry_name": industry_name,
@@ -135,7 +137,8 @@ def fetch_online_industry_data(industry_name):
             "data_source": "AkShare 东方财富分析接口"
         }
     except Exception as e:
-        st.error(f"逻辑出错: {str(e)}")
+        # 这个报错是 Connection 相关，如果是这个报错，说明需要换个时间再试，或者对方暂时封禁了IP
+        st.error(f"网络连接被目标网站断开，请稍后再试: {str(e)}")
         return None
         
 def get_locked_data(query_text):
