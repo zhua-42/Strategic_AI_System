@@ -107,9 +107,8 @@ def fetch_online_industry_data(industry_name):
         if target.empty: return None
         
         # 只要能跑通这一行，你就成功了
-        df = ak.stock_board_industry_index_ths(symbol=target.iloc[0]['name'])
-        st.error(f"成功获取数据！列名是: {df.columns.tolist()}") 
-        
+        df = ak.stock_financial_report_yjbb(symbol="20251231")
+        st.error(f"新的财务报表列名: {df.columns.tolist()}")        
         return {
             "industry_name": target.iloc[0]['name'],
             "cr4": 55.0, "avg_roe": 12.5, "net_profit_margin": 10.2,
