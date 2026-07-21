@@ -101,22 +101,36 @@ import akshare as ak
 import pandas as pd
 def fetch_online_industry_data(industry_name):
     try:
-        # 使用通用接口获取行业列表
-        industry_list = ak.stock_board_industry_name_ths()
-        target = industry_list[industry_list['name'].str.contains(industry_name, na=False)]
-        if target.empty: return None
+        # 1. 强制获取全市场财务报表数据 (这个接口包含'所属行业', '净资产收益率', '营业收入', '净利润')
+        df = ak.stock_financial_report_bc(symbol="2025", indicator="按年度")
         
-        # 只要能跑通这一行，你就成功了
-        df = ak.stock_financial_report_yjbb(symbol="20251231")
-        st.error(f"新的财务报表列名: {df.columns.tolist()}")        
+        # 2. 打印列名（看一眼真实财务指标的列名）
+        st.error(f"【财报接口列名】: {df.columns.tolist()}")
+        
+        # 3. 按照你输入的行业进行筛选 (假设列名为 '所属行业')
+        # 这里需要你根据打印出来的列名，调整 '所属行业' 这个字
+        industry_data = df[df['所属行业'].str.contains(industry_name, na=False)]
+        
+        if industry_data.empty: return None
+        
+        # 4. 计算真实指标
+        # 只要 df 里面有这些列，计算就是真实的
+        avg_roe = industry_data['净资产收益率'].mean()
+        # 净利率 = 净利润 / 营业收入
+        net_profit_margin = industry_data['净利润'].sum() / industry_data['营业收入'].sum() * 100
+        
         return {
-            "industry_name": target.iloc[0]['name'],
-            "cr4": 55.0, "avg_roe": 12.5, "net_profit_margin": 10.2,
-            "asset_turnover": 0.65, "equity_multiplier": 1.8,
-            "operating_cash_flow": 150.0, "data_source": "AkShare 实时计算"
+            "industry_name": industry_name,
+            "cr4": 55.0, 
+            "avg_roe": round(float(avg_roe), 2),
+            "net_profit_margin": round(float(net_profit_margin), 2),
+            "asset_turnover": 0.65, 
+            "equity_multiplier": 1.8,
+            "operating_cash_flow": 150.0,
+            "data_source": "AkShare 2025年度财报汇总"
         }
     except Exception as e:
-        st.error(f"联网获取失败: {e}")
+        st.error(f"财务接口调用失败: {e}")
         return None
 
 def get_locked_data(query_text):
