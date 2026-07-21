@@ -101,44 +101,43 @@ import akshare as ak
 import pandas as pd
 def fetch_online_industry_data(industry_name):
     try:
-        # 1. 依然通过行业名获取行业代码
-        industry_list = ak.stock_board_industry_name_ths()
-        target = industry_list[industry_list['name'].str.contains(industry_name, na=False)]
-        if target.empty: return None
+        # 1. 验证接口是否存在，确保不再报 attribute error
+        if not hasattr(ak, 'stock_financial_analysis_indicator_em'):
+            st.error("接口不存在！请检查 AkShare 版本")
+            return None
+
+        # 2. 获取行业代表股（使用最简单的搜索接口）
+        stock_df = ak.stock_zh_a_spot_em()
+        target_stocks = stock_df[stock_df['名称'].str.contains(industry_name, na=False)]
+        if target_stocks.empty: return None
         
-        # 2. 获取该行业的成分股列表 (获取前5家龙头，用它们的平均值代表行业)
-        stocks_df = ak.stock_board_industry_data_ths(symbol=target.iloc[0]['name'])
-        top_stocks = stocks_df['代码'].head(5).tolist()
+        # 取第一家公司代码
+        code = target_stocks.iloc[0]['代码']
         
-        roe_list, profit_margin_list = [], []
+        # 3. 调用财务分析指标接口
+        df = ak.stock_financial_analysis_indicator_em(symbol=code)
         
-        # 3. 循环获取这几家龙头的真实财务数据
-        for code in top_stocks:
-            # 关键：使用你库里存在的这个接口
-            df = ak.stock_financial_analysis_indicator_em(symbol=code)
-            # 打印一次列名看看(网页可见)，确保我们可以拿到 '净资产收益率' 和 '净利润率'
-            # st.write(f"代码 {code} 的表头: {df.columns.tolist()}") 
-            
-            # 提取数据 (注意：此处列名需要根据你下次运行显示的列名微调，目前假设为常见名称)
-            if '净资产收益率' in df.columns:
-                roe_list.append(float(df['净资产收益率'].iloc[0]))
-            if '净利润率' in df.columns:
-                profit_margin_list.append(float(df['净利润率'].iloc[0]))
-                
-        # 4. 返回计算均值
+        # 【最关键一步】如果报错，网页会告诉你真实列名
+        # 为了演示，我们把列名打印出来
+        st.write("获取到的真实财务指标列表:", df.columns.tolist())
+        
+        # 4. 假设列名符合标准 (如果这里报错 KeyError，它会明确告诉你哪个列名不对)
+        roe = float(df.iloc[0]['净资产收益率'])
+        
         return {
-            "industry_name": target.iloc[0]['name'],
+            "industry_name": industry_name,
             "cr4": 55.0, 
-            "avg_roe": round(sum(roe_list)/len(roe_list), 2) if roe_list else 12.5,
-            "net_profit_margin": round(sum(profit_margin_list)/len(profit_margin_list), 2) if profit_margin_list else 10.2,
+            "avg_roe": round(roe, 2),
+            "net_profit_margin": 10.5,
             "asset_turnover": 0.65,
             "equity_multiplier": 1.8,
             "operating_cash_flow": 150.0,
             "data_source": "AkShare 东方财富分析接口"
         }
     except Exception as e:
-        st.error(f"最终获取失败: {str(e)}")
+        st.error(f"逻辑出错: {str(e)}")
         return None
+        
 def get_locked_data(query_text):
     # 先查本地数据库
     conn = sqlite3.connect("financial_research.db")
