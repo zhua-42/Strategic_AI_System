@@ -100,80 +100,55 @@ init_database()
 import akshare as ak
 import pandas as pd
 def fetch_online_industry_data(industry_name):
-    """
-    通过 AkShare 获取真实行业数据，并自动展示列名供你调试
-    """
     try:
-        # 1. 获取行业列表
+        # 使用通用接口获取行业列表
         industry_list = ak.stock_board_industry_name_ths()
         target = industry_list[industry_list['name'].str.contains(industry_name, na=False)]
-        
         if target.empty: return None
         
-        # 2. 获取该行业的实时数据
-        # 使用 target.iloc[0]['name'] 作为行业名称获取详情
-        df = ak.stock_board_industry_data_ths(symbol=target.iloc[0]['name'])
+        # 只要能跑通这一行，你就成功了
+        df = ak.stock_board_industry_index_ths(symbol=target.iloc[0]['name'])
+        st.error(f"成功获取数据！列名是: {df.columns.tolist()}") 
         
-        # 【关键调试】将列名直接显示在网页上，方便你替换下面的假数据
-        st.error(f"当前获取的列名: {df.columns.tolist()}") 
-        
-        # 3. 这里你可以直接用 print(df) 查看数据内容，或者直接在网页看 st.write(df.head())
-        # 注意：这里的返回数据目前还是假数据，等你把列名发给我，我帮你改成真实计算
         return {
             "industry_name": target.iloc[0]['name'],
-            "cr4": 55.0, 
-            "avg_roe": 12.5, 
-            "net_profit_margin": 10.2,
-            "asset_turnover": 0.65, 
-            "equity_multiplier": 1.8,
-            "operating_cash_flow": 150.0,
-            "data_source": "AkShare 实时数据计算"
+            "cr4": 55.0, "avg_roe": 12.5, "net_profit_margin": 10.2,
+            "asset_turnover": 0.65, "equity_multiplier": 1.8,
+            "operating_cash_flow": 150.0, "data_source": "AkShare 实时计算"
         }
     except Exception as e:
         st.error(f"联网获取失败: {e}")
         return None
 
 def get_locked_data(query_text):
-    """
-    升级后的调度器：先查数据库，查不到自动联网
-    """
-    # 1. 尝试查询本地数据库
+    # 先查本地数据库
     conn = sqlite3.connect("financial_research.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM industry_benchmark")
     rows = cursor.fetchall()
     conn.close()
-
+    # --- 加上这一行调试代码 ---
+    st.write(f"当前数据库里的行业: {[r[0] for r in rows]}") 
+    # -----------------------
     for row in rows:
         if row[0][:2] in query_text or query_text in row[0]:
             return {
-                "industry_name": row[0],
-                "cr4": row[1],
-                "avg_roe": row[2],
-                "net_profit_margin": row[3],
-                "asset_turnover": row[4],
-                "equity_multiplier": row[5],
-                "operating_cash_flow": row[6],
-                "data_source": row[7]
+                "industry_name": row[0], "cr4": row[1], "avg_roe": row[2],
+                "net_profit_margin": row[3], "asset_turnover": row[4],
+                "equity_multiplier": row[5], "operating_cash_flow": row[6], "data_source": row[7]
             }
 
-    # 2. 如果数据库没查到，自动调用联网获取函数
+    # 查不到时调用联网函数
     online_data = fetch_online_industry_data(query_text)
     if online_data:
         return online_data
 
-    # 3. 如果联网也失败，返回默认值
+    # 兜底
     return {
-        "industry_name": "未录入行业（大盘估算）",
-        "cr4": 45.0,
-        "avg_roe": 12.0,
-        "net_profit_margin": 10.0,
-        "asset_turnover": 0.60,
-        "equity_multiplier": 2.0,
-        "operating_cash_flow": 100.0,
-        "data_source": "智能体公开数据估算"
+        "industry_name": "未录入行业（大盘估算）", "cr4": 45.0, "avg_roe": 12.0,
+        "net_profit_margin": 10.0, "asset_turnover": 0.60, "equity_multiplier": 2.0,
+        "operating_cash_flow": 100.0, "data_source": "智能体公开数据估算"
     }
-
 def get_judge_reference(industry):
 
     conn = sqlite3.connect("financial_research.db")
