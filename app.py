@@ -100,56 +100,52 @@ init_database()
 import akshare as ak
 import pandas as pd
 def fetch_online_industry_data(industry_name):
+    """
+    通过 AkShare 获取真实行业数据，并自动展示列名供你调试
+    """
     try:
-        # 1. 获取行业列表 (确认列名是 name 和 code)
+        # 1. 获取行业列表
         industry_list = ak.stock_board_industry_name_ths()
-        
-        # 使用 'name' 进行匹配
         target = industry_list[industry_list['name'].str.contains(industry_name, na=False)]
         
         if target.empty: return None
         
-        # 使用 'code' 获取代码
-        industry_code = target.iloc[0]['code']
-        
         # 2. 获取该行业的实时数据
-        # 此时你应该使用 code 去调用对应的行业详情接口
+        # 使用 target.iloc[0]['name'] 作为行业名称获取详情
         df = ak.stock_board_industry_data_ths(symbol=target.iloc[0]['name'])
-       # --- 这一行代码会直接把列名显示在网页上！---
-        st.error(f"当前获取的列名: {df.columns.tolist()}") 
-        # ------------------------------------------
-        # 【关键点】这里要根据你获得的 df 再 print(df.columns) 一次，
-        # 才能知道财务指标的列名是什么！
         
+        # 【关键调试】将列名直接显示在网页上，方便你替换下面的假数据
+        st.error(f"当前获取的列名: {df.columns.tolist()}") 
+        
+        # 3. 这里你可以直接用 print(df) 查看数据内容，或者直接在网页看 st.write(df.head())
+        # 注意：这里的返回数据目前还是假数据，等你把列名发给我，我帮你改成真实计算
         return {
             "industry_name": target.iloc[0]['name'],
             "cr4": 55.0, 
-            "avg_roe": 12.5, # 替换逻辑同理，对照 df.columns 里的名字
+            "avg_roe": 12.5, 
             "net_profit_margin": 10.2,
             "asset_turnover": 0.65, 
             "equity_multiplier": 1.8,
             "operating_cash_flow": 150.0,
-            "data_source": "AkShare 实时数据"
+            "data_source": "AkShare 实时数据计算"
         }
     except Exception as e:
-        print(f"数据获取失败: {e}")
+        st.error(f"联网获取失败: {e}")
         return None
+
 def get_locked_data(query_text):
-    
+    """
+    升级后的调度器：先查数据库，查不到自动联网
+    """
+    # 1. 尝试查询本地数据库
     conn = sqlite3.connect("financial_research.db")
     cursor = conn.cursor()
-
     cursor.execute("SELECT * FROM industry_benchmark")
     rows = cursor.fetchall()
-
     conn.close()
 
-
-    # 简单模糊匹配行业
     for row in rows:
-
         if row[0][:2] in query_text or query_text in row[0]:
-
             return {
                 "industry_name": row[0],
                 "cr4": row[1],
@@ -161,17 +157,21 @@ def get_locked_data(query_text):
                 "data_source": row[7]
             }
 
+    # 2. 如果数据库没查到，自动调用联网获取函数
+    online_data = fetch_online_industry_data(query_text)
+    if online_data:
+        return online_data
 
-    # 默认数据
+    # 3. 如果联网也失败，返回默认值
     return {
         "industry_name": "未录入行业（大盘估算）",
-        "cr4":45.0,
-        "avg_roe":12.0,
-        "net_profit_margin":10.0,
-        "asset_turnover":0.60,
-        "equity_multiplier":2.0,
-        "operating_cash_flow":100.0,
-        "data_source":"智能体公开数据估算"
+        "cr4": 45.0,
+        "avg_roe": 12.0,
+        "net_profit_margin": 10.0,
+        "asset_turnover": 0.60,
+        "equity_multiplier": 2.0,
+        "operating_cash_flow": 100.0,
+        "data_source": "智能体公开数据估算"
     }
 
 def get_judge_reference(industry):
@@ -414,30 +414,21 @@ def run_research_flow(user_input, log_callback, status_callback):
 
 请审查以下Agent结果。
 
-
 ======== Research Agent ========
 
 {res_research}
-
-
 
 ======== Financial Agent ========
 
 {res_financial}
 
-
-
 ======== Policy Agent ========
 
 {res_policy}
 
-
-
 ======== Risk Agent ========
 
 {res_risk}
-
-
 
 ======== 财务数据库 ========
 
@@ -450,44 +441,27 @@ ROE:
 净利润率:
 {db_data["net_profit_margin"]}
 
-
-
 ======== 政策数据库 ========
 
 {judge_reference["policy"]}
-
-
 
 ======== 风险数据库 ========
 
 {judge_reference["risk"]}
 
 
-
 请完成：
-
 1.
 数据交叉验证：
-
 检查Agent结论是否与数据库一致。
-
-
 2.
 Agent逻辑一致性：
-
 检查Research、Financial、Policy、Risk是否互相矛盾。
-
-
 3.
 财务合理性：
-
 检查ROE、利润率、现金流逻辑。
-
-
 4.
 来源可信度。
-
-
 必须返回JSON：
 
 {{
@@ -504,7 +478,6 @@ Agent逻辑一致性：
 }}
 
 """
-
 
     res_verifier = client.chat.completions.create(
         model="deepseek-chat",
@@ -523,13 +496,11 @@ Agent逻辑一致性：
             .replace("```","")
         )
 
-
     except:
 
         judge_result={
         "pass":True
         }
-
 
     if judge_result.get("pass")==False:
 
@@ -537,7 +508,6 @@ Agent逻辑一致性：
         failed_agent=judge_result.get(
             "failed_agent"
         )
-
 
         log_callback(
         f"⚠️ Judge拒绝报告，退回{failed_agent}重新生成"
