@@ -297,6 +297,12 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     """
     行业大盘与个股杜邦对标双模协同流水线
     """
+    print(f"DEBUG: 接收到的行业输入: {user_input}")
+    print(f"DEBUG: 接收到的个股输入: {company_name}")
+    
+    company_data = get_company_data(company_name)
+    print(f"DEBUG: 检索到的个股数据: {company_data}") 
+    # 如果这里打印出来是 None，问题就找到了
     db_data = get_locked_data(user_input)
     company_data = None
     
