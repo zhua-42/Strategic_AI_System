@@ -295,19 +295,22 @@ with st.sidebar:
 # --- 7. 核心 7-Agent 流水线实现 ---
 def run_research_flow(user_input, log_callback, status_callback, company_name=""):
     """
-    行业大盘与个股杜邦对标双模协同流水线
+    修复后的行业大盘与个股杜邦对标双模协同流水线
     """
     print(f"DEBUG: 接收到的行业输入: {user_input}")
     print(f"DEBUG: 接收到的个股输入: {company_name}")
     
-    company_data = get_company_data(company_name)
-    print(f"DEBUG: 检索到的个股数据: {company_data}") 
-    # 如果这里打印出来是 None，问题就找到了
+    # 1. 获取行业数据
     db_data = get_locked_data(user_input)
     
+    # 2. 统一获取个股数据 (如果 company_name 为空，company_data 保持为 None)
+    company_data = None
     if company_name:
         company_data = get_company_data(company_name)
-        
+    
+    print(f"DEBUG: 检索到的个股数据: {company_data}") 
+    
+    # 3. 根据 company_data 是否存在，生成对应的 financial_prompt (确保此变量一定会被赋值)
     if company_data:
         log_callback(f"🔑 [Database] 已匹配到标的公司：{company_name}。开启个股与 {db_data['industry_name']} 杜邦对标审计。")
         financial_prompt = f"""
@@ -332,7 +335,6 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         """
     else:
         log_callback(f"🔑 [Database] 已锁死行业大盘数据。数据来源: {db_data['data_source']}")
-        print(f"DEBUG: 当前正在使用的提示词: {financial_prompt}")
         financial_prompt = f"""
         根据我们锁死的底层行业数据：
         行业名称: {db_data['industry_name']}
@@ -345,6 +347,9 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         1. 杜邦三要素驱动机制
         2. 是否存在利润质量恶化（如应收账款周转放缓，参考PDF 3第9页）
         """
+    
+    print(f"DEBUG: 当前正在使用的提示词: {financial_prompt[:50]}...") # 打印提示词开头确认逻辑
+
 
     # 装载本地知识库 RAG
     log_callback("🔍 [RAG Engine] 正在对 knowledge/ 文件夹中的年报PDF与审计底稿进行语义对齐...")
