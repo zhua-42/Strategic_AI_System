@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 from docx import Document  # 用于生成Word文档
 from docx.shared import Inches  # 用于Word文档中精细调整图表大小
 import akshare as ak
+import pdfplumber  # 导入推荐技术栈中的 PDF 处理库
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -102,74 +103,96 @@ import pandas as pd
 import time
 import random
 
-def fetch_online_industry_data(industry_name):
-    try:
-        # 1. 随机睡眠，减少并发压力
-        time.sleep(random.uniform(1, 3)) 
-        
-        # 2. 获取行业代表股 (stock_zh_a_spot_em 接口最稳，不容易被封)
-        stock_df = ak.stock_zh_a_spot_em()
-        
-        # 筛选行业相关股票
-        target_stocks = stock_df[stock_df['名称'].str.contains(industry_name, na=False)]
-        if target_stocks.empty: return None
-        
-        # 3. 只取 1 家代表性公司即可 (减少请求次数，防止被封)
-        code = target_stocks.iloc[0]['代码']
-        
-        # 4. 获取财务指标
-        # 再次确认：stock_financial_analysis_indicator_em 是最稳定的
-        df = ak.stock_financial_analysis_indicator_em(symbol=code)
-        
-        # 网页打印表头以便调试 (现在应该能正常看到了)
-        st.write(f"成功获取 {code} 财务数据，列名: {df.columns.tolist()}")
-        
-        roe = float(df.iloc[0]['净资产收益率']) if '净资产收益率' in df.columns else 12.0
-        
-        return {
-            "industry_name": industry_name,
-            "cr4": 55.0, 
-            "avg_roe": round(roe, 2),
-            "net_profit_margin": 10.5,
-            "asset_turnover": 0.65,
-            "equity_multiplier": 1.8,
-            "operating_cash_flow": 150.0,
-            "data_source": "AkShare 东方财富分析接口"
-        }
-    except Exception as e:
-        # 这个报错是 Connection 相关，如果是这个报错，说明需要换个时间再试，或者对方暂时封禁了IP
-        st.error(f"网络连接被目标网站断开，请稍后再试: {str(e)}")
-        return None
-        
+import pandas as pd
+
 def get_locked_data(query_text):
-    # 先查本地数据库
-    conn = sqlite3.connect("financial_research.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM industry_benchmark")
-    rows = cursor.fetchall()
-    conn.close()
-    # --- 加上这一行调试代码 ---
-    st.write(f"当前数据库里的行业: {[r[0] for r in rows]}") 
-    # -----------------------
-    for row in rows:
-        if row[0][:2] in query_text or query_text in row[0]:
+    """
+    升级后的双层数据调度器：
+    第一层：SQLite（快速查找核心数据库）
+    第二层：CSV 行业镜像（大盘补充数据库，防止云端反爬崩溃）
+    """
+    # 1. 第一层：查找 SQLite 数据库
+    try:
+        conn = sqlite3.connect("financial_research.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM industry_benchmark")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        for row in rows:
+            # 模糊匹配
+            if row[0][:2] in query_text or query_text in row[0]:
+                return {
+                    "industry_name": row[0],
+                    "cr4": row[1],
+                    "avg_roe": row[2],
+                    "net_profit_margin": row[3],
+                    "asset_turnover": row[4],
+                    "equity_multiplier": row[5],
+                    "operating_cash_flow": row[6],
+                    "data_source": row[7]
+                }
+    except Exception as e:
+        # SQLite 容错处理
+        pass
+
+    # 2. 第二层：查找 CSV 大盘镜像表
+    try:
+        df = pd.read_csv("industry_data.csv")
+        # 模糊匹配
+        target = df[df['行业名称'].str.contains(query_text[:2], na=False) | df['行业名称'].str.contains(query_text, na=False)]
+        
+        if not target.empty:
+            row = target.iloc[0]
             return {
-                "industry_name": row[0], "cr4": row[1], "avg_roe": row[2],
-                "net_profit_margin": row[3], "asset_turnover": row[4],
-                "equity_multiplier": row[5], "operating_cash_flow": row[6], "data_source": row[7]
+                "industry_name": row['行业名称'],
+                "cr4": float(row['CR4']),
+                "avg_roe": float(row['ROE']),
+                "net_profit_margin": float(row['净利润率']),
+                "asset_turnover": float(row['资产周转率']),
+                "equity_multiplier": float(row['权益乘数']),
+                "operating_cash_flow": float(row['经营现金流']),
+                "data_source": f"CSV 离线镜像 - {row['数据来源']}"
             }
+    except Exception as e:
+        # CSV 容错处理
+        pass
 
-    # 查不到时调用联网函数
-    online_data = fetch_online_industry_data(query_text)
-    if online_data:
-        return online_data
-
-    # 兜底
+    # 3. 兜底策略：默认大盘估算
     return {
-        "industry_name": "未录入行业（大盘估算）", "cr4": 45.0, "avg_roe": 12.0,
-        "net_profit_margin": 10.0, "asset_turnover": 0.60, "equity_multiplier": 2.0,
-        "operating_cash_flow": 100.0, "data_source": "智能体公开数据估算"
+        "industry_name": "未录入行业（大盘估算）",
+        "cr4": 45.0,
+        "avg_roe": 12.0,
+        "net_profit_margin": 10.0,
+        "asset_turnover": 0.60,
+        "equity_multiplier": 2.0,
+        "operating_cash_flow": 100.0,
+        "data_source": "智能体公开数据估算"
     }
+def get_company_data(company_name):
+    """
+    个股数据检索器
+    """
+    try:
+        df = pd.read_csv("company_data.csv")
+        # 模糊匹配公司名称
+        target = df[df['公司名称'].str.contains(company_name, na=False)]
+        if not target.empty:
+            row = target.iloc[0]
+            return {
+                "code": row['股票代码'],
+                "name": row['公司名称'],
+                "industry": row['所属行业'],
+                "roe": float(row['ROE']),
+                "margin": float(row['净利润率']),
+                "turnover": float(row['资产周转率']),
+                "multiplier": float(row['权益乘数']),
+                "cash": float(row['经营现金流']),
+                "pain_point": row['核心痛点']
+            }
+    except Exception as e:
+        pass
+    return None
 def get_judge_reference(industry):
 
     conn = sqlite3.connect("financial_research.db")
@@ -188,19 +211,68 @@ def get_judge_reference(industry):
     )
 
     risk = cursor.fetchone()
-
     conn.close()
-
     return {
-
         "policy":
             policy if policy else "暂无政策数据",
-
         "risk":
             risk if risk else "暂无风险数据"
-
     }
+def get_rag_context(query_text, top_k=2):
+    """
+    RAG 本地知识库检索系统：
+    自动扫描 ./knowledge/ 文件夹下的所有 PDF 或 TXT 财务报告，
+    使用 pdfplumber 精准抽取文本并切片（Chunking），基于查询词相关性提取最契合的财务准则与披露数据。
+    """
+    context_chunks = []
+    knowledge_dir = "knowledge"
+    
+    # 如果文件夹不存在，自动创建并写入引导性示范文件
+    if not os.path.exists(knowledge_dir):
+        os.makedirs(knowledge_dir)
+        with open(os.path.join(knowledge_dir, "policy_and_risk_standard.txt"), "w", encoding="utf-8") as f:
+            f.write("新能源汽车支持政策：落实15%高新技术企业所得税优惠，地方绿色金融提供专项低息贴息贷款。\n")
+            f.write("新能源汽车行业风险：重点审计应收账款周转放缓，防范因国家补贴退坡导致的资产减值及坏账拨备风险。\n")
+            f.write("白酒行业监管风险：注意税收政策调整红线、食品安全合规红线，防范存货减值和三公消费限制。\n")
+            
+    if not os.path.exists(knowledge_dir):
+        return "本地 RAG 知识库未装载。"
 
+    # 扫描文件夹下的 PDF/TXT 并切片
+    for filename in os.listdir(knowledge_dir):
+        filepath = os.path.join(knowledge_dir, filename)
+        text_content = ""
+        try:
+            if filename.endswith(".pdf"):
+                with pdfplumber.open(filepath) as pdf:
+                    for page in pdf.pages:
+                        text_content += page.extract_text() or ""
+            elif filename.endswith(".txt"):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    text_content = f.read()
+            
+            if text_content:
+                # 简单分段 (按换行符和句号，形成 Chunk)
+                chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 10]
+                
+                # 关键词匹配度计算 (模拟 Embedding 相似度匹配)
+                keywords = [word for word in query_text if len(word) >= 1]
+                for chunk in chunks:
+                    match_score = sum(1.5 for kw in keywords if kw in chunk)
+                    if match_score > 0:
+                        context_chunks.append((match_score, chunk, filename))
+        except Exception as e:
+            print(f"RAG 解析 {filename} 失败: {e}")
+            
+    # 按匹配度由高到低排序，提取 top_k 段核心数据
+    context_chunks.sort(key=lambda x: x[0], reverse=True)
+    results = context_chunks[:top_k]
+    
+    if not results:
+        return "本地 RAG 知识库暂无直接关联的底稿或法规数据。"
+        
+    formatted_context = "\n".join([f"📖 [RAG底稿来源: {r[2]}] {r[1]}" for r in results])
+    return formatted_context
 # --- 3. 辅助解析函数 ---
 def extract_report_data(raw_report):
     clean_text = raw_report
@@ -253,27 +325,277 @@ with st.sidebar:
             
     st.divider()
     st.title("🛠 启动投研")
-    query = st.text_input("输入调研课题/公司", placeholder="如：新能源汽车")
+    
+    # 🌟 新增：模式选择器 🌟
+    research_mode = st.radio("选择分析模式", ["行业大盘深度分析", "个股 vs 行业基准对比"])
+    
+    if research_mode == "行业大盘深度分析":
+        query = st.text_input("输入调研课题/行业", placeholder="如：新能源汽车")
+        company_query = ""
+    else:
+        company_query = st.text_input("输入标的公司名称", placeholder="如：比亚迪")
+        query = st.selectbox("选择所属行业", ["新能源汽车", "白酒行业", "家电制造", "房地产", "银行业"])
+        
     submit_btn = st.button("🚀 开启 7-Agent 深度协同")
-    st.caption("提示：结合数据库及真实性验证，需要约1~2分钟。:D")
+    st.caption("提示：结合本地离线数据仓库及 RAG，无需网络请求，零崩溃风险，需要约1~2分钟。:D")
 
 # --- 7. 核心 7-Agent 流水线实现 (解决痛点 10, 16, 17, 18) ---
-def run_research_flow(user_input, log_callback, status_callback):
-    # 第一步：锁定底层真实数据
+def run_research_flow(user_input, log_callback, status_callback, company_name=""):
+    """
+    升级后的 7-Agent 深度协同流水线：
+    支持单行业分析模式与个股 vs 行业杜邦对标双模式
+    """
+    # 1. 锁死大盘或行业底表数据
     db_data = get_locked_data(user_input)
-    # --- 插入这段逻辑，实现自动检测并调用 AkShare ---
-    if db_data["industry_name"] == "未录入行业（大盘估算）":
-        log_callback("🌐 [Research Agent] 数据库无记录，正在尝试 AkShare 在线获取...")
-        online_data = fetch_online_industry_data(user_input)
-        if online_data:
-            db_data = online_data
-            log_callback(f"✅ [Research Agent] AkShare 获取成功: {db_data['industry_name']}")
-    # --- 插入结束 ---
+    company_data = None
+    
+    # 2. 如果是个股模式，加载个股数据
+    if company_name:
+        company_data = get_company_data(company_name)
+        
+    if company_data:
+        log_callback(f"🔑 [Database] 已匹配到标的公司：{company_name}。开启个股与 {db_data['industry_name']} 行业对标审计。")
+        # 针对个股对标，定制 Financial Agent 的分析 Prompt
+        financial_prompt = f"""
+        你现在是资深特许金融分析师 (CFA) 和高级财务审计专家。
+        
+        请对标的公司【{company_name}】与【{db_data['industry_name']}】行业均值进行深度的杜邦分解对标审计。
+        
+        【{company_name} 真实财务指标】：
+        - 标杆 ROE: {company_data['roe']}%
+        - 净利润率: {company_data['margin']}%
+        - 资产周转率 (次): {company_data['turnover']}
+        - 权益乘数 (杠杆): {company_data['multiplier']}
+        - 经营现金流 (万元): {company_data['cash']}
+        - 核心经营痛点: '{company_data['pain_point']}'
+        
+        【{db_data['industry_name']} 行业均值指标】：
+        - 标杆 ROE: {db_data['avg_roe']}%
+        - 净利润率: {db_data['net_profit_margin']}%
+        - 资产周转率 (次): {db_data['asset_turnover']}
+        - 权益乘数 (杠杆): {db_data['equity_multiplier']}
+        - 经营现金流基准 (万元): {db_data['operating_cash_flow']}
+        
+        请完成专业审计与投研诊断：
+        1. 深入杜邦三要素（净利润率、资产周转率、权益乘数）拆解，诊断该个股相比行业平均的核心超额收益来源或劣势动因。
+        2. 结合其核心经营痛点：'{company_data['pain_point']}'，评估该个股的应收账款质量、存货质量及潜在财务流动性爆雷风险（参考PDF财务质量框架）。
+        """
+    else:
+        log_callback(f"🔑 [Database] 已锁死行业大盘数据。数据来源: {db_data['data_source']}")
+        # 传统的行业财务分析 Prompt
+        financial_prompt = f"""
+        根据我们锁死的底层行业数据：
+        行业名称: {db_data['industry_name']}
+        标杆ROE: {db_data['avg_roe']}%
+        净利润率: {db_data['net_profit_margin']}%
+        资产周转率: {db_data['asset_turnover']}
+        权益乘数: {db_data['equity_multiplier']}
+        
+        请分析：
+        1. 杜邦三要素驱动机制
+        2. 是否存在利润质量恶化（如应收账款周转放缓，参考PDF 3第9页）
+        """
+
+    # 3. 装载本地知识库 RAG
+    log_callback("🔍 [RAG Engine] 正在对 knowledge/ 文件夹中的年报PDF与审计底稿进行语义对齐...")
+    rag_context = get_rag_context(user_input, top_k=3)
+    log_callback("✅ [RAG Engine] 本地知识库数据提取完成！")
+    
+    # 4. Planner Agent (规划)
+    status_callback("Planner", "running")
+    log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
+    time.sleep(1)
+    
+    # 5. Research Agent (竞争分析)
+    status_callback("Research", "running")
+    log_callback("🔍 [Research Agent] 查询大盘，融合数据库，构建竞争集中度 (CR4) 指标...")
+    research_prompt = f"""
+    根据以下行业数据库信息：
+    行业: {db_data['industry_name']}
+    CR4市场集中度: {db_data['cr4']}%
+    数据来源: {db_data['data_source']}
+
+    请完成行业竞争格局分析：
+    1. 行业集中度分析
+    2. 龙头企业竞争优势
+    3. 行业竞争趋势
+    4. 市场进入壁垒
+    注意：所有分析必须基于给定数据，不允许编造具体数字。
+    """
+    res_research = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role":"user", "content":research_prompt}],
+        temperature=0.3
+    ).choices[0].message.content
+    
+    # 6. Financial Agent (杜邦与利润质量)
+    status_callback("Financial", "running")
+    log_callback("📊 [Financial Agent] 计算杜邦公式并进行审计诊断...")
+    res_financial = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": financial_prompt}],
+        temperature=0.3
+    ).choices[0].message.content
+
+    # 7. Policy Agent (政策拆解)
+    status_callback("Policy", "running")
+    log_callback("📜 [Policy Agent] 精细化政策拆解：行业限制、税收优惠及环保壁垒...")
+    policy_prompt = f"""
+    针对 '{user_input}'，请详述其面临的最新行业准入门槛、15%高新技术税收优惠政策，以及绿色金融支持力度。
+    
+    【本地RAG知识库权威检索底稿（必须以此为依据，严禁编造数据）：】
+    {rag_context}
+    """
+    res_policy = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": policy_prompt}]
+    ).choices[0].message.content
+
+    # 8. Risk Agent (风险扫描)
+    status_callback("Risk", "running")
+    log_callback("🚩 [Risk Agent] 核心风险扫描：供应链及财务流动性敞口...")
+    risk_prompt = f"""
+    请分析：
+    行业: {db_data['industry_name']}
+    财务数据:
+    ROE: {db_data['avg_roe']}%
+    净利润率: {db_data['net_profit_margin']}%
+    经营现金流: {db_data['operating_cash_flow']}
+
+    【本地RAG知识库风险底稿检索（必须进行针对性审计披露）：】
+    {rag_context}
+
+    请输出：
+    1. 财务风险
+    2. 经营风险
+    3. 供应链风险
+    4. 政策风险
+    """
+    res_risk = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": risk_prompt}],
+        temperature=0.3
+    ).choices[0].message.content
+   
+    # 9. Verifier Agent (自审)
+    status_callback("Judge", "running")
+    log_callback("⚖️ [Verifier Agent] 数据真实性校验：比对底表与LLM决策...")
+    judge_reference = get_judge_reference(db_data["industry_name"])
+    verifier_prompt = f"""
+    你现在是投研系统的总审计Judge Agent。
+    请审查以下Agent结果。
+    ======== Research Agent ========
+    {res_research}
+    ======== Financial Agent ========
+    {res_financial}
+    ======== Policy Agent ========
+    {res_policy}
+    ======== Risk Agent ========
+    {res_risk}
+    ======== 财务数据库 ========
+    行业: {db_data["industry_name"]}
+    ROE: {db_data["avg_roe"]}
+    净利润率: {db_data["net_profit_margin"]}
+    ======== 政策数据库 ========
+    {judge_reference["policy"]}
+    ======== 风险数据库 ========
+    {judge_reference["risk"]}
+    
+    请完成：
+    1. 数据交叉验证：检查结论是否与数据库一致。
+    2. Agent逻辑一致性。
+    必须返回JSON：
+    {{"score": 95, "pass": true, "failed_agent": "None", "reason": "无", "retry_instruction": "无"}}
+    """
+    res_verifier = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role":"user", "content":verifier_prompt}],
+        temperature=0.1
+    ).choices[0].message.content
+
+    # 10. Report Agent (总装)
+    status_callback("Report", "running")
+    log_callback("✍️ [Report Agent] 研报总装中，正在融合数据对标与 RAG 底稿分析...")
+    report_prompt = f"""
+    请将以下模块融合，撰写一篇券商标准的行业深度研报：
+    1. 财务分析与杜邦对标诊断（基于杜邦分解分析）：{res_financial}
+    2. 核心政策环境与RAG底稿透视：{res_policy}
+    3. 数据可验证自评报告：{res_verifier}
+    
+    必须附带“AI生成免责声明”。
+    """
+    res_report = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": report_prompt}],
+        temperature=0.4
+    ).choices[0].message.content
+
+    # 11. 动态图表数据输出控制
+    if company_data:
+        # 个股对标模式图表数据
+        chart_data = {
+            "company_name": company_name,
+            "company_roe": company_data["roe"],
+            "company_margin": company_data["margin"],
+            "company_turnover": company_data["turnover"],
+            "company_multiplier": company_data["multiplier"],
+            "company_cash": company_data["cash"],
+            "industry_roe": db_data["avg_roe"],
+            "industry_margin": db_data["net_profit_margin"],
+            "industry_turnover": db_data["asset_turnover"],
+            "industry_multiplier": db_data["equity_multiplier"],
+            "industry_cash": db_data["operating_cash_flow"],
+            "locked_source": f"个股: {company_data['name']} 与 行业: {db_data['industry_name']} 双重锁定"
+        }
+    else:
+        # 传统行业分析大盘模式
+        base_size = 500 if "银" in db_data["industry_name"] or "白酒" in db_data["industry_name"] else 200
+        chart_data = {
+            "market_share": {
+                "labels": ["头部企业 (CR4)", "中坚力量", "尾部企业"],
+                "values": [db_data["cr4"], max(5.0, 100 - db_data["cr4"] - 15), 15]
+            },
+            "market_growth": {
+                "years": ["2022", "2023", "2024", "2025", "2026(E)"],
+                "market_size": [int(base_size * f) for f in [0.8, 0.92, 1.0, 1.08, 1.15]],
+                "growth_rate": [15.0, 13.5, 10.2, 8.5, 7.8]
+            },
+            "financial_trend": {
+                "years": ["2022", "2023", "2024", "2025", "2026Q2"],
+                "roe_trend": [round(db_data["avg_roe"] * f, 2) for f in [1.15, 1.08, 1.0, 0.96, 0.92]],
+                "margin_trend": [round(db_data["net_profit_margin"] * f, 2) for f in [1.10, 1.05, 1.0, 0.98, 0.95]]
+            },
+            "capability_comparison": {
+                "metrics": ["盈利能力(ROE%)", "短期流动性(流动比率x10)", "资产效率(周转率x100)", "安全边际(现金流%)"],
+                "values": [round(db_data["avg_roe"], 2), 15.0, round(db_data["asset_turnover"]*100, 2), round(db_data["net_profit_margin"]*1.5, 2)]
+            },
+            "risk_radar": {
+                "dimensions": ["偿债与财务杠杆风险", "短期流动性紧缺风险", "存货/资产减值风险", "盈利质量恶化风险", "政策合规与壁垒风险"],
+                "values": [
+                    round(min(5.0, db_data["equity_multiplier"] * 1.2), 2), 
+                    3.2, 
+                    round(min(5.0, (1.0 - db_data["asset_turnover"]) * 4.5), 2), 
+                    round(max(1.0, 5.0 - db_data["net_profit_margin"]/10), 2), 
+                    3.8
+                ]
+            },
+            "locked_source": db_data["data_source"]
+        }
+
+    final_text = f"{res_report}\n\n```json\n{json.dumps(chart_data)}\n```"
+    log_callback("✅ 工作流执行完毕。智能投研报告及图表已就绪！")
+    return final_text
+    # 第一步：锁定底层真实数据 (已自动融合 SQLite 和 CSV 离线镜像)
+    db_data = get_locked_data(user_input)
     
     # 临时测试数据库是否正常返回
-    log_callback(str(db_data))
     log_callback(f"🔑 [Database] 已锁死底层真实财报底表。数据来源: {db_data['data_source']}")
-    
+    # 🌟 在工作流开头自动执行 RAG 检索 🌟
+    # ==========================================
+    log_callback("🔍 [RAG Engine] 正在对 knowledge/ 文件夹中的年报PDF与审计底稿进行语义对齐...")
+    rag_context = get_rag_context(user_input, top_k=3)
+    log_callback(f"✅ [RAG Engine] 本地知识库数据提取完成！")
+
     # 1. Planner Agent (规划)
     status_callback("Planner", "running")
     log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
@@ -285,16 +607,12 @@ def run_research_flow(user_input, log_callback, status_callback):
     time.sleep(1)
     research_prompt = f"""
     根据以下行业数据库信息：
-
     行业:
     {db_data['industry_name']}
-
     CR4市场集中度:
     {db_data['cr4']}%
-
     数据来源:
     {db_data['data_source']}
-
 
     请完成行业竞争格局分析：
 
@@ -302,12 +620,9 @@ def run_research_flow(user_input, log_callback, status_callback):
     2. 龙头企业竞争优势
     3. 行业竞争趋势
     4. 市场进入壁垒
-
-
     注意：
     所有分析必须基于给定数据，不允许编造具体数字。
     """
-
     res_research = client.chat.completions.create(
         model="deepseek-chat",
         messages=[
@@ -318,6 +633,7 @@ def run_research_flow(user_input, log_callback, status_callback):
         ],
         temperature=0.3
     ).choices[0].message.content
+    
     # 3. Financial Agent (杜邦分解与利润质量 - 参考 PDF 3 & PDF 2)
     status_callback("Financial", "running")
     log_callback("📊 [Financial Agent] 计算杜邦公式：ROE 与核心利润分析...")
@@ -343,7 +659,13 @@ def run_research_flow(user_input, log_callback, status_callback):
     # 4. Policy Agent (政策红线细化 - 解决痛点 10)
     status_callback("Policy", "running")
     log_callback("📜 [Policy Agent] 精细化政策拆解：行业限制、税收优惠及环保壁垒...")
-    policy_prompt = f"针对 '{user_input}'，请详述其面临的最新行业准入门槛、15%高新技术税收优惠政策，以及绿色金融支持力度。"
+    
+    policy_prompt = f"""
+    针对 '{user_input}'，请详述其面临的最新行业准入门槛、15%高新技术税收优惠政策，以及绿色金融支持力度。
+    
+    【本地RAG知识库权威检索底稿（必须以此为依据，严禁编造数据）：】
+    {rag_context}
+    """
     res_policy = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": policy_prompt}]
@@ -353,43 +675,27 @@ def run_research_flow(user_input, log_callback, status_callback):
     status_callback("Risk", "running")
     log_callback("🚩 [Risk Agent] 核心风险扫描：供应链及财务流动性敞口...")
     time.sleep(1)
+    
     risk_prompt = f"""
-
     请分析：
-
-    行业:
-    {db_data['industry_name']}
-
-
+    行业: {db_data['industry_name']}
     财务数据:
+    ROE: {db_data['avg_roe']}%
+    净利润率: {db_data['net_profit_margin']}%
+    经营现金流: {db_data['operating_cash_flow']}
 
-    ROE:
-    {db_data['avg_roe']}%
-
-    净利润率:
-    {db_data['net_profit_margin']}%
-
-    经营现金流:
-    {db_data['operating_cash_flow']}
-
+    【本地RAG知识库风险底稿检索（必须进行针对性审计披露）：】
+    {rag_context}
 
     请输出：
-
     1. 财务风险
     2. 经营风险
     3. 供应链风险
     4. 政策风险
-
     """
-
     res_risk = client.chat.completions.create(
         model="deepseek-chat",
-        messages=[
-            {
-            "role":"user",
-            "content":risk_prompt
-            }
-        ],
+        messages=[{"role": "user", "content": risk_prompt}],
         temperature=0.3
     ).choices[0].message.content
    
@@ -600,20 +906,32 @@ def update_agent_status(agent, state):
 
 # --- 9. 主面板报告与动态画图 (解决痛点 3, 5, 14) ---
 with col_main:
-    if submit_btn and query:
+    # 🌟 修改：支持大盘模式或个股模式任意输入之一即可触发 🌟
+    if submit_btn and (query or company_query):
         st.session_state['logs_history'] = []
-        raw_report = run_research_flow(query, log_callback=append_log, status_callback=update_agent_status)
+        
+        # 调用时传入 company_name 参数
+        raw_report = run_research_flow(
+            query, 
+            log_callback=append_log, 
+            status_callback=update_agent_status,
+            company_name=company_query # 将侧边栏的个股输入传入
+        )
         clean_text, dynamic_data = extract_report_data(raw_report)
         
         st.session_state['current_report'] = clean_text
         st.session_state['current_data'] = dynamic_data
-        st.session_state['current_query'] = query
-        st.session_state['history'].insert(0, {"query": query, "content": clean_text, "data": dynamic_data})
+        # 历史记录里显示标的公司或行业名
+        st.session_state['current_query'] = company_query if company_query else query
+        st.session_state['history'].insert(0, {
+            "query": st.session_state['current_query'], 
+            "content": clean_text, 
+            "data": dynamic_data
+        })
         
         for agent in ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]:
             st.session_state[f"status_{agent}"] = "success"
         st.rerun()
-
     if st.session_state['current_report']:
         st.markdown(f"## 📋 {st.session_state['current_query']} 深度研报分析")
         
@@ -759,96 +1077,171 @@ with col_main:
             st.write("#### 🔗 产业链全景逻辑流 ")
             
             # 动态解析或使用静态兜底数据
-            if data and "supply_chain" in data and len(data["supply_chain"]) > 0:
-                nodes = [item.get("node", "") for item in data["supply_chain"]]
-                companies = [item.get("companies", "") for item in data["supply_chain"]]
-                details = [item.get("details", "") for item in data["supply_chain"]]
-                x = [item.get("x", idx) for idx, item in enumerate(data["supply_chain"])]
-                y = [item.get("y", 0.0 if idx % 2 == 0 else 0.5) for idx, item in enumerate(data["supply_chain"])]
-                z = [item.get("z", 0.0 if idx % 2 == 0 else 1.0) for idx, item in enumerate(data["supply_chain"])]
-            else:
-                nodes = ['基础材料', '核心零部件', '整机/系统集成', '下游应用', '售后/回收']
-                x = [0, 1, 2, 3, 4]
-                y = [0, 0.5, -0.5, 0.2, 0]
-                z = [0, 1, 0, 1, 0]
-                companies = ['宝钢股份、中复神鹰', '宁德时代、汇川技术', '西门子、大疆、亿航', '顺丰、国家电网', '格林美、各品牌4S']
-                details = ['提供碳纤维、高性能钢材等原始原料', '电机、电池、传感器等核心组件生产', '产品组装、飞控系统及AI算法集成', '物流配送、工业巡检、消费文旅等', '设备维护及资源循环再利用']
+            if st.session_state['current_report']:
+                st.markdown(f"## 📋 {st.session_state['current_query']} 深度研报分析")
+        
+        # A. 动态数据看板展示 (双模式适配)
+        data = st.session_state['current_data']
+        is_company_mode = "company_name" in data  # 核心判断：是否是个股对比模式
+        
+        with st.container():
+            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            
+            with c1:
+                if is_company_mode:
+                    # 🌟 图表 1 (个股模式)：个股与行业杜邦因子对标图 🌟
+                    fig_comp = go.Figure(data=[
+                        go.Bar(
+                            name=data["company_name"], 
+                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'], 
+                            y=[data["company_roe"], data["company_margin"], data["company_turnover"]*100, data["company_multiplier"]*10],
+                            marker_color='#1e3a8a'
+                        ),
+                        go.Bar(
+                            name='行业均值基准', 
+                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'], 
+                            y=[data["industry_roe"], data["industry_margin"], data["industry_turnover"]*100, data["industry_multiplier"]*10],
+                            marker_color='#ef4444'
+                        )
+                    ])
+                    fig_comp.update_layout(
+                        title=f"{data['company_name']} 与行业杜邦因子对比 (标煤化)", 
+                        barmode='group', height=300, margin=dict(l=10, r=10, t=40, b=10)
+                    )
+                    st.plotly_chart(fig_comp, use_container_width=True)
+                    
+                    pdf_buffer_comp = io.BytesIO()
+                    fig_comp.write_image(file=pdf_buffer_comp, format="pdf")
+                    st.download_button(
+                        label="📊 导出杜邦对标图为 PDF",
+                        data=pdf_buffer_comp.getvalue(),
+                        file_name="dupont_comparison_chart.pdf",
+                        mime="application/pdf",
+                        key="dl_comp_pdf"
+                    )
+                else:
+                    # 传统图表 1 (大盘模式)：市场集中度 (CR4)
+                    share_data = data.get("market_share", {"labels": ["集中度 (CR4)", "其他企业"], "values": [55, 45]})
+                    fig_pie = go.Figure(data=[go.Pie(labels=share_data["labels"], values=share_data["values"], hole=.4)])
+                    fig_pie.update_layout(title="市场集中度 (CR4) 动态格局", height=300, margin=dict(l=10, r=10, t=40, b=10))
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                    
+                    pdf_buffer_pie = io.BytesIO()
+                    fig_pie.write_image(file=pdf_buffer_pie, format="pdf")
+                    st.download_button(
+                        label="📊 导出竞争格局图为 PDF",
+                        data=pdf_buffer_pie.getvalue(),
+                        file_name="market_share_chart.pdf",
+                        mime="application/pdf",
+                        key="dl_pie"
+                    )
+                
+            with c2:
+                if is_company_mode:
+                    # 🌟 图表 2 (个股模式)：个股 vs 行业多维财务能力雷达图 🌟
+                    fig_radar = go.Figure()
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=[data["company_roe"], data["company_margin"], data["company_turnover"]*10, data["company_multiplier"], data["company_cash"]/10],
+                        theta=['ROE', '净利润率', '资产周转率', '财务杠杆', '经营现金流'],
+                        fill='toself', name=data["company_name"], line=dict(color='#1e3a8a')
+                    ))
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=[data["industry_roe"], data["industry_margin"], data["industry_turnover"]*10, data["industry_multiplier"], data["industry_cash"]/10],
+                        theta=['ROE', '净利润率', '资产周转率', '财务杠杆', '经营现金流'],
+                        fill='toself', name='行业平均', line=dict(color='#ef4444')
+                    ))
+                    fig_radar.update_layout(
+                        polar=dict(radialaxis=dict(visible=True, range=[0, max(50.0, data["company_roe"]*1.5)])),
+                        title="标的公司与行业能力多维透视", height=300, margin=dict(l=10, r=10, t=40, b=10)
+                    )
+                    st.plotly_chart(fig_radar, use_container_width=True)
+                    
+                    pdf_buffer_radar = io.BytesIO()
+                    fig_radar.write_image(file=pdf_buffer_radar, format="pdf")
+                    st.download_button(
+                        label="📈 导出能力对标雷达图为 PDF",
+                        data=pdf_buffer_radar.getvalue(),
+                        file_name="capability_radar_chart.pdf",
+                        mime="application/pdf",
+                        key="dl_radar_pdf"
+                    )
+                else:
+                    # 传统图表 2 (大盘模式)：市场规模与增速分析图
+                    growth_data = data.get("market_growth", {"years": ["2022", "2023", "2024", "2025", "2026(E)"], "market_size": [100, 110, 120, 130, 140], "growth_rate": [10, 10, 9, 8, 7]})
+                    fig_growth = go.Figure()
+                    fig_growth.add_trace(go.Bar(x=growth_data["years"], y=growth_data["market_size"], name="市场规模 (亿元)", yaxis="y1", marker_color="#1e3a8a"))
+                    fig_growth.add_trace(go.Scatter(x=growth_data["years"], y=growth_data["growth_rate"], name="增速 (%)", yaxis="y2", mode="lines+markers", line=dict(color="#ef4444", width=3)))
+                    fig_growth.update_layout(title="行业市场规模与复合增速图", height=300, yaxis=dict(title="市场规模 (亿元)", side="left"), yaxis2=dict(title="增速 (%)", side="right", overlaying="y", showgrid=False))
+                    st.plotly_chart(fig_growth, use_container_width=True)
+                    
+                    pdf_buffer_growth = io.BytesIO()
+                    fig_growth.write_image(file=pdf_buffer_growth, format="pdf")
+                    st.download_button(label="📈 导出市场规模增速图为 PDF", data=pdf_buffer_growth.getvalue(), file_name="market_growth_chart.pdf", mime="application/pdf", key="dl_growth")
+
+            # --- 下方渲染其他通用能力（3D 产业链及免责声明） ---
+            st.caption(f"🛡️ **真实性校验数据保障源**：{data.get('locked_source', '离线核心数据镜像')}")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # 3D 产业链板块保持不变
+        with st.container():
+            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+            st.write("#### 🔗 产业链全景逻辑流 ")
+            nodes = ['基础材料', '核心零部件', '整机/系统集成', '下游应用', '售后/回收']
+            x_3d = [0, 1, 2, 3, 4]
+            y_3d = [0, 0.5, -0.5, 0.2, 0]
+            z_3d = [0, 1, 0, 1, 0]
+            companies = ['宝钢股份、中复神鹰', '宁德时代、汇川技术', '西门子、大疆、亿航', '顺丰、国家电网', '格林美、各品牌4S']
+            details = ['提供原始原材料', '电机、电池等核心组件生产', '产品组装、系统集成', '物流配送、工业巡检等', '设备维护及资源再利用']
 
             fig_3d = go.Figure(data=[go.Scatter3d(
-                x=x, y=y, z=z,
+                x=x_3d, y=y_3d, z=z_3d,
                 mode='markers+lines+text',
-                marker=dict(size=12, color=['#d62728', '#1f77b4', '#d62728', '#1f77b4', '#333'][:len(nodes)], opacity=0.8),
+                marker=dict(size=12, color=['#d62728', '#1f77b4', '#d62728', '#1f77b4', '#333'], opacity=0.8),
                 line=dict(color='#1f77b4', width=6),
                 text=nodes,
                 hoverinfo='text',
-                hovertext=[f"环节: {n}<br>业务: {d}<br>代表企业: {c}" for n,d,c in zip(nodes, details, companies)]
+                hovertext=[f"环节: {n}<br>代表企业: {c}" for n,c in zip(nodes, companies)]
             )])
-            fig_3d.update_layout(
-                height=450, 
-                margin=dict(l=0, r=0, b=0, t=0), 
-                scene=dict(
-                    xaxis_title='流程阶段', 
-                    yaxis_title='价值分布', 
-                    zaxis_title='技术壁垒'
-                )
-            )
+            fig_3d.update_layout(height=400, margin=dict(l=0, r=0, b=0, t=0))
             st.plotly_chart(fig_3d, use_container_width=True)
-            
-            # --- 💡 加分项：为 3D 产业链添加高保真 PDF 矢量图下载按钮 ---
-            pdf_buffer_3d = io.BytesIO()
-            fig_3d.write_image(file=pdf_buffer_3d, format="pdf")
-            st.download_button(
-                label="📊 导出 3D 产业链图为 PDF 矢量图",
-                data=pdf_buffer_3d.getvalue(),
-                file_name="supply_chain_chart.pdf",
-                mime="application/pdf",
-                key="dl_3d"
-            )
             st.markdown('</div>', unsafe_allow_html=True)
-        # =========================================================================
 
         # B. 研报正文展示
         st.markdown('<div class="report-container">', unsafe_allow_html=True)
         st.markdown(st.session_state['current_report'])
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # --- ✅ 第二处修改：全面升级 Word 导出逻辑，将动态数据图表直接完美嵌入到文档中 ---
+        # C. 升级后的 Word 文档导出逻辑（动态嵌入对比图）
         doc = Document()
         doc.add_heading(f"{st.session_state['current_query']} 深度战略研报", level=1)
-        doc.add_paragraph(f"研报生成时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-        doc.add_paragraph("本报告由 SQLite 本地数据库真实数据锚定，并经由多智能体协同校验输出。")
+        doc.add_paragraph("本报告由 SQLite 本地数据库及企业离线镜像真实数据锚定，并经由多智能体协同校验输出。")
         doc.add_paragraph("-" * 50)
 
-        # 插入图表数据 (同步更新为：竞争格局、市场增速、能力对比图，使其美观嵌入Word)
-        doc.add_heading("第一部分：数字化数据看板", level=2)
+        doc.add_heading("第一部分：数据看板可视化底图", level=2)
         try:
-            colors = ['#1f77b4', '#d62728', '#32a852', '#ff7f0e']
-            share_labels = data.get("market_share", {}).get("labels", ['核心头部', '中坚力量', '初创企业', '其他'])
-            share_values = data.get("market_share", {}).get("values", [45, 25, 15, 15])
-            fig_pie_exp = go.Figure(data=[go.Pie(labels=share_labels, values=share_values, hole=.4, marker=dict(colors=colors))])
-            fig_pie_exp.update_layout(title="市场份额分布预期 (CR4)")
-
-            # 导出趋势图
-            trend_data_exp = data.get("financial_trend", {"years": ["2022", "2023", "2024", "2025", "2026Q2"], "roe_trend": [12, 11, 10, 9.5, 9.1], "margin_trend": [10, 9.5, 9, 8.8, 8.5]})
-            fig_trend_exp = go.Figure()
-            fig_trend_exp.add_trace(go.Scatter(x=trend_data_exp["years"], y=trend_data_exp["roe_trend"], mode='lines+markers', name='ROE'))
-            fig_trend_exp.add_trace(go.Scatter(x=trend_data_exp["years"], y=trend_data_exp["margin_trend"], mode='lines+markers', name='Net Margin'))
-            fig_trend_exp.update_layout(title="主要盈利指标变化趋势")
-
-            # 渲染为内存 PNG 并写入 Word
-            img_bytes_pie = fig_pie_exp.to_image(format="png", width=550, height=350)
-            img_bytes_trend = fig_trend_exp.to_image(format="png", width=550, height=350)
-            
-            doc.add_paragraph("1.1 行业市场竞争格局图：")
-            doc.add_picture(io.BytesIO(img_bytes_pie), width=Inches(5.5))
-            doc.add_paragraph("1.2 财务指标演化走势图：")
-            doc.add_picture(io.BytesIO(img_bytes_trend), width=Inches(5.5))
-            
-            doc.add_paragraph(f"数据校验锚定底表源：{data.get('locked_source', '数据校验底表')}")
+            if is_company_mode:
+                # 导出对标柱状图
+                fig_comp_exp = go.Figure(data=[
+                    go.Bar(name=data["company_name"], x=['ROE', 'Margin', 'Turnover*100', 'Multiplier*10'], y=[data["company_roe"], data["company_margin"], data["company_turnover"]*100, data["company_multiplier"]*10]),
+                    go.Bar(name='Industry Average', x=['ROE', 'Margin', 'Turnover*100', 'Multiplier*10'], y=[data["industry_roe"], data["industry_margin"], data["industry_turnover"]*100, data["industry_multiplier"]*10])
+                ])
+                fig_comp_exp.update_layout(title="Company vs Industry Dupont Comparison")
+                img_bytes = fig_comp_exp.to_image(format="png", width=550, height=350)
+                doc.add_paragraph("1.1 标的公司与行业杜邦对标图：")
+                doc.add_picture(io.BytesIO(img_bytes), width=Inches(5.5))
+            else:
+                share_labels = data.get("market_share", {}).get("labels", ['核心头部', '其他'])
+                share_values = data.get("market_share", {}).get("values", [55, 45])
+                fig_pie_exp = go.Figure(data=[go.Pie(labels=share_labels, values=share_values, hole=.4)])
+                img_bytes = fig_pie_exp.to_image(format="png", width=550, height=350)
+                doc.add_paragraph("1.1 行业市场竞争格局图：")
+                doc.add_picture(io.BytesIO(img_bytes), width=Inches(5.5))
         except Exception as e:
-            doc.add_paragraph(f"[数字化看板导出失败: {e}]")
-        # 插入报告正文
-        doc.add_heading("第二部分：战略及财务质量深度透视", level=2)
+            doc.add_paragraph(f"[看板图表导出失败: {e}]")
+
+        # 插入研报正文至 Word 
+        doc.add_heading("第二部分：深度透视战略正文", level=2)
         report_text = st.session_state['current_report']
         for paragraph in report_text.split('\n'):
             if paragraph.strip():
@@ -856,52 +1249,12 @@ with col_main:
                     doc.add_heading(paragraph.replace("# ", ""), level=1)
                 elif paragraph.startswith("## "):
                     doc.add_heading(paragraph.replace("## ", ""), level=2)
-                elif paragraph.startswith("### "):
-                    doc.add_heading(paragraph.replace("### ", ""), level=3)
                 else:
                     doc.add_paragraph(paragraph)
 
         bio = io.BytesIO()
         doc.save(bio)
-        # =========================================================================
-        # 🚩 新增：风险雷达图（移至特定风险审计版块）
-        # =========================================================================
-        with st.container():
-            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
-            st.write("#### 🚩 企业经营及财务多维风险指数测算 ")
-            
-            risk_data = data.get("risk_radar", {
-                "dimensions": ["偿债与财务杠杆风险", "短期流动性紧缺风险", "存货/资产减值风险", "盈利质量恶化风险", "政策合规与壁垒风险"],
-                "values": [3.0, 3.2, 2.8, 3.5, 4.0]
-            })
-            
-            fig_risk_radar = go.Figure()
-            fig_risk_radar.add_trace(go.Scatterpolar(
-                r=risk_data["values"],
-                theta=risk_data["dimensions"],
-                fill='toself',
-                name='风险系数 (1表示极安全，5表示极高风险)',
-                line=dict(color='#ef4444', width=2),
-                fillcolor='rgba(239, 68, 68, 0.3)'
-            ))
-            fig_risk_radar.update_layout(
-                polar=dict(radialaxis=dict(visible=True, range=[0, 5.0])),
-                title="企业整体经营及财务审计风险度量雷达模型 (基于PDF财务质量框架评估)",
-                height=350,
-                margin=dict(l=20, r=20, t=40, b=20)
-            )
-            st.plotly_chart(fig_risk_radar, use_container_width=True)
-            
-            pdf_buffer_risk = io.BytesIO()
-            fig_risk_radar.write_image(file=pdf_buffer_risk, format="pdf")
-            st.download_button(
-                label="🚩 导出风险雷达图为 PDF 矢量图",
-                data=pdf_buffer_risk.getvalue(),
-                file_name="risk_radar_chart.pdf",
-                mime="application/pdf",
-                key="dl_risk_radar"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
+
         st.download_button(
             label="📥 导出完整研报（含数据图表）.docx",
             data=bio.getvalue(),
