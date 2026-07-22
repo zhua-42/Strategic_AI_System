@@ -304,7 +304,6 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     print(f"DEBUG: 检索到的个股数据: {company_data}") 
     # 如果这里打印出来是 None，问题就找到了
     db_data = get_locked_data(user_input)
-    company_data = None
     
     if company_name:
         company_data = get_company_data(company_name)
@@ -333,6 +332,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         """
     else:
         log_callback(f"🔑 [Database] 已锁死行业大盘数据。数据来源: {db_data['data_source']}")
+        print(f"DEBUG: 当前正在使用的提示词: {financial_prompt}")
         financial_prompt = f"""
         根据我们锁死的底层行业数据：
         行业名称: {db_data['industry_name']}
