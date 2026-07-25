@@ -7,5 +7,7 @@ urllib3>=2.0.0
 python-docx>=1.2.0
 kaleido==0.2.1
 akshare>=1.18.0
-pandas
+pandas>=2.0.0
 pdfplumber
+chromadb>=0.5.0
+sentence-transformers>=2.7.0
