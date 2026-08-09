@@ -22,12 +22,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="数智投研多智能体系统", layout="wide")
 
 load_dotenv()
+# 方式 A：从环境加载（推荐）
 api_key = os.getenv("DEEPSEEK_API_KEY")
 
 # 初始化 OpenAI 客户端
 client = OpenAI(
     api_key=api_key if api_key else "your-api-key",
-    base_url="https://api.deepseek.com/v1" 
+    base_url="https://api.deepseek.com"  # 建议去掉尾部的 /v1
 )
 
 # --- 2. 初始化本地SQLite数据库 (数据层分离改造) ---
