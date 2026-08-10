@@ -21,14 +21,30 @@ from sentence_transformers import SentenceTransformer
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="数智投研多智能体系统", layout="wide")
 
-load_dotenv()
-# 方式 A：从环境加载（推荐）
-api_key = os.getenv("DEEPSEEK_API_KEY")
+# 【优化读取逻辑】
+api_key = None
 
-# 初始化 OpenAI 客户端
+# 1. 优先尝试从 Streamlit 官方 Secrets 中读取（解决云端部署覆盖问题）
+if "DEEPSEEK_API_KEY" in st.secrets:
+    api_key = st.secrets["DEEPSEEK_API_KEY"]
+
+# 2. 如果 Secrets 没读到，再尝试读取本地 .env（兼容本地开发运行）
+if not api_key:
+    load_dotenv()
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+
+# 3. 【自我诊断工具】在页面侧边栏打印当前加载状态（排查后可自行删除）
+if not api_key or api_key.strip() in ["your-api-key", ""]:
+    st.error("⚠️ 【诊断提示】系统目前读取到的 API Key 依然为空或默认占位符！这说明您的配置未生效，请检查 Streamlit Secrets 或 `.env`。")
+    st.stop()
+else:
+    # 仅展示前4位和总长度，确保密钥安全
+    st.sidebar.success(f"🔑 密钥载入成功 (长度: {len(api_key)}位, 开头: {api_key[:4]}...)")
+
+# 4. 初始化 OpenAI 客户端
 client = OpenAI(
-    api_key=api_key if api_key else "your-api-key",
-    base_url="https://api.deepseek.com"  # 建议去掉尾部的 /v1
+    api_key=api_key,
+    base_url="https://api.deepseek.com"  # 建议改为官方标准的 base_url，避免带 /v1 导致请求路径叠加
 )
 
 # --- 2. 初始化本地SQLite数据库 (数据层分离改造) ---
