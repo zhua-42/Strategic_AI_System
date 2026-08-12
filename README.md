@@ -1,0 +1,111 @@
+# Strategic AI System — AI 多智能体智能投研系统
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://jbmelfwhrlgagcsrpvhkqy.streamlit.app)
+
+一个以 **多智能体协作** 为核心、**数据可溯源** 的智能投研系统：把一次完整的投研工作（行业研究、财务审计、估值建模、多空辩论、风险复核、报告撰写）拆解为 7 个智能体接力执行的流水线，并给每条核心结论挂上可追溯的证据链。
+
+---
+
+## 项目简介
+
+投研工作最大的痛点不是信息不足，而是 **信息过载 + 结论不可信**：单一大模型直接生成研报容易幻觉、数字没有来源、多空逻辑纠缠不清。
+
+本项目把一次研究任务拆成一条工业化的流水线：
+
+1. **需求理解** —— 把用户一句话转化为结构化研究任务；
+2. **数据规划与获取** —— 明确要哪些数据，从本地数据库、知识库、文件与新闻中取数并记录来源；
+3. **专业分析** —— 行业研究 / 财务分析 / 政策分析 / 估值 / 风险 五个 Agent 各司其职；
+4. **多空辩论** —— 财务专家与风险总监正面对抗，降低确认偏误；
+5. **专家委员会终审** —— 消除矛盾、交叉验证，产出带可信度等级的证据链；
+6. **研报生成** —— 按券商研报结构输出完整报告与可视化看板。
+
+## 核心特性
+
+- **7-Agent 协作流水线**：需求理解 → 数据规划 → 数据获取 → 专业分析（行业/财务/政策/估值/风险）→ 多空辩论 → 专家委员会 → 研报生成，全程可视化跟踪每个 Agent 的状态。
+- **函数调用（Function Calling）**：DCF 两阶段估值、杜邦分解、财务数据库查询等工具由模型自主触发，不是"嘴上分析"，而是真实计算。
+- **RAG 本地知识库**：自动索引知识库中的 PDF 文档（货币政策报告等），检索宏观政策底稿，让分析有据可依。
+- **多空辩论机制**：Financial Agent（乐观方）与 Risk Agent（风险审计方）围绕同一标的对抗质证，把多空证据完整摊开。
+- **数据证据链（Evidence Ledger）**：专家委员会对每条核心结论标注 来源 / 字段 / 页码 / 可信等级（A/B/C），输出可复核、可审计的存证面板。
+- **可视化看板**：杜邦对标柱状图、能力雷达图、市场规模与增速、风险雷达、3D 产业链图谱等，均可导出 PDF。
+- **报告导出**：一键导出包含图表与证据表的 Word 深度研报。
+- **双模式输入**：简易模式（一句话快速分析）与标准模式（公司/行业 + 时间周期 + 报告类型 + 研究目的自定义）。
+
+## 系统架构
+
+![架构图-流水线](docs/architecture-1.png)
+
+![架构图-委员会与输出](docs/architecture-2.png)
+
+架构分为五层：
+
+| 层级 | 职责 |
+| --- | --- |
+| 输入层 | 用户输入公司/行业、时间周期、研究目的 |
+| Agent 层 | 7 个 Agent：需求理解、数据规划、数据获取、行业研究、财务分析、政策分析、估值、风险、专家委员会、研报生成 |
+| 工具层 | DCF、杜邦分析、SQLite 查询、Excel/PDF/新闻读取等可执行工具 |
+| 数据层 | SQLite 基准库（行业/个股/政策/风险）+ RAG 向量知识库 + 申万行业分类 |
+| 输出层 | Streamlit 可视化看板、Word/PDF 报告、数据证据链 |
+
+## 在线演示
+
+👉 [https://jbmelfwhrlgagcsrpvhkqy.streamlit.app](https://jbmelfwhrlgagcsrpvhkqy.streamlit.app)
+
+> 免费托管的应用在闲置一段时间后会进入休眠，首次打开可能需要等待约半分钟，属正常现象。
+
+## 快速开始
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/zhua-42/Strategic_AI_System.git
+cd Strategic_AI_System
+
+# 2. 安装依赖（Python >= 3.10）
+pip install -r requirements.txt
+
+# 3. 配置密钥
+cp .env.example .env   # Windows: copy .env.example .env
+# 编辑 .env，填入你的 DEEPSEEK_API_KEY
+
+# 4. 启动
+streamlit run app.py
+```
+
+云端部署（Streamlit Community Cloud）时，请在应用的 **Secrets** 中配置同样的 `DEEPSEEK_API_KEY`。
+
+## 项目结构
+
+```text
+app.py                  # Streamlit 主应用：7-Agent 流水线 + 全部 UI
+company_data.csv        # 个股财务基准数据
+industry_data.csv       # 行业财务基准数据
+financial_research.db   # SQLite 数据库（行业/个股/政策/风险基准表）
+requirements.txt        # 依赖清单
+knowledge/
+  ├── 2025年第四季度中国货币政策执行报告.pdf   # RAG 知识库（宏观政策底稿）
+  ├── 2025年货币当局资产负债表.pdf
+  └── industry/                               # 申万行业分类与个股映射
+docs/                   # 系统架构图
+```
+
+## 技术栈
+
+| 类别 | 技术 |
+| --- | --- |
+| 应用框架 | Python · Streamlit |
+| 大模型 | DeepSeek（OpenAI SDK · Function Calling） |
+| 数据 | SQLite · pandas · akshare |
+| RAG | ChromaDB · sentence-transformers · pdfplumber |
+| 可视化 | Plotly |
+| 文档导出 | python-docx · kaleido |
+
+## Roadmap
+
+- [ ] 量化评测集：构建回归测试集，与裸 LLM 基线对比（引用覆盖率 / 事实准确率 / 报告结构完整度）
+- [ ] ESG 报告抓取与评级智能体
+- [ ] 并购标的尽职调查智能体
+- [ ] 定时盯盘与推送（盘前分析 / 盘中提示 / 周报）
+- [ ] 年报 PDF 上传解析，直接进入分析流水线
+
+## 免责声明
+
+本系统所有输出均由 AI 生成，仅供学习与研究参考，**不构成任何投资建议**。系统中的数据来源以标注为准，投资决策与风险由使用者自行承担。
