@@ -10,6 +10,7 @@ venv/
 venv.bak/
 
 # 本地运行时生成的数据
+data/
 vector_db/
 
 # 操作系统文件

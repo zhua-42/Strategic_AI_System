@@ -16,6 +16,7 @@ import pdfplumber  # 导入推荐技术栈中的 PDF 处理库
 import pandas as pd
 import chromadb
 from sentence_transformers import SentenceTransformer
+import product_features as pf
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,8 +26,11 @@ st.set_page_config(page_title="数智投研多智能体系统", layout="wide")
 api_key = None
 
 # 1. 优先尝试从 Streamlit 官方 Secrets 中读取（解决云端部署覆盖问题）
-if "DEEPSEEK_API_KEY" in st.secrets:
-    api_key = st.secrets["DEEPSEEK_API_KEY"]
+try:
+    if "DEEPSEEK_API_KEY" in st.secrets:
+        api_key = st.secrets["DEEPSEEK_API_KEY"]
+except Exception:
+    pass  # 本地未配置 secrets.toml 时跳过，继续尝试 .env
 
 # 2. 如果 Secrets 没读到，再尝试读取本地 .env（兼容本地开发运行）
 if not api_key:
@@ -46,6 +50,20 @@ client = OpenAI(
     api_key=api_key,
     base_url="https://api.deepseek.com"  # 建议改为官方标准的 base_url，避免带 /v1 导致请求路径叠加
 )
+
+# --- 记录每次 LLM 调用的 token 用量（用于使用数据看板） ---
+_orig_create = client.chat.completions.create
+
+def _tracked_create(*args, **kwargs):
+    resp = _orig_create(*args, **kwargs)
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        stats = st.session_state.setdefault("usage_stats", {"input_tokens": 0, "output_tokens": 0})
+        stats["input_tokens"] = stats.get("input_tokens", 0) + int(getattr(usage, "prompt_tokens", 0) or 0)
+        stats["output_tokens"] = stats.get("output_tokens", 0) + int(getattr(usage, "completion_tokens", 0) or 0)
+    return resp
+
+client.chat.completions.create = _tracked_create
 
 # --- 2. 初始化本地SQLite数据库 (数据层分离改造) ---
 def init_database():
@@ -256,9 +274,81 @@ def auto_align_industry(company_name="", query_industry=""):
 # ============================
 # 🌟 Vector Database & RAG 自动同步 🌟
 # ============================
-@st.cache_resource
+# 本地模型目录（优先加载，完全离线可用）
+LOCAL_MODEL_DIR = os.path.join("models", "paraphrase-multilingual-MiniLM-L12-v2")
+
+
+def _source_reachable(url, timeout=5):
+    """快速探测模型源是否可达，避免在网络不通时长时间卡住。"""
+    import socket
+    try:
+        host = url.split("//")[1].split("/")[0]
+        socket.create_connection((host, 443), timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _run_with_timeout(fn, seconds):
+    """在独立线程中执行 fn；超过 seconds 秒仍未完成则放弃，避免网络异常时无限卡住。"""
+    import threading
+    box = {}
+
+    def _target():
+        try:
+            box["value"] = fn()
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        return None
+    if "error" in box:
+        return None
+    return box.get("value")
+
+
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
+    """加载向量模型：优先本地 models/ 目录（离线），其次国内镜像，最后官方源；全部失败返回 None（降级为关键词检索）。"""
+    # 1) 本地模型目录（最优先，无需联网）
+    if os.path.isdir(LOCAL_MODEL_DIR):
+        try:
+            return SentenceTransformer(LOCAL_MODEL_DIR)
+        except Exception:
+            pass
+    # 2) 国内镜像 -> 官方源（先探测可达性，不通立即跳过；下载有超时保护）
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "8")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "8")
+    # 本地环境（fix_and_run.ps1 设置了 SAS_FAST_START）给 20 秒快速失败；
+    # 云端部署给 120 秒，保证首次能下载完约 470MB 的模型。
+    per_source_timeout = 20 if os.environ.get("SAS_FAST_START") == "1" else 120
+    # 国内本地环境：先走镜像；云端部署（无 SAS_FAST_START）：直接走官方源更快
+    if os.environ.get("SAS_FAST_START") == "1":
+        endpoints = ["https://hf-mirror.com", "https://huggingface.co"]
+    else:
+        endpoints = ["https://huggingface.co", "https://hf-mirror.com"]
+    for endpoint in endpoints:
+        if not _source_reachable(endpoint):
+            continue
+        os.environ["HF_ENDPOINT"] = endpoint
+        model = _run_with_timeout(
+            lambda: SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
+            seconds=per_source_timeout,
+        )
+        if model is not None:
+            return model
+    print("[RAG] 向量模型加载失败（网络受限），已降级为关键词检索。可将模型放入 models/paraphrase-multilingual-MiniLM-L12-v2 后重启启用向量检索。")
+    return None
+
+
 def get_vector_db_and_model():
-    model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    with st.spinner("正在准备 AI 检索能力，请稍候（若网络受限会自动切换为快速模式）..."):
+        model = load_embedding_model()
+    if model is None:
+        return None, None
     v_client = chromadb.PersistentClient(path="./vector_db")
     coll = v_client.get_or_create_collection(name="financial_knowledge")
     
@@ -292,7 +382,13 @@ def get_vector_db_and_model():
 
 embedding_model, collection = get_vector_db_and_model()
 
+if embedding_model is None:
+    st.sidebar.info("当前为“关键词检索”模式：AI 语义模型未加载成功，网页功能不受影响。将模型文件放入 models/ 文件夹后重启，即可升级为更智能的语义检索。")
+
 def vector_search(query_text, top_k=3):
+    # 向量库不可用（如模型未下载成功）时，降级为关键词检索
+    if embedding_model is None or collection is None:
+        return get_rag_context(query_text, top_k=top_k)
     try:
         query_embedding = embedding_model.encode(query_text).tolist()
         result = collection.query(query_embeddings=[query_embedding], n_results=top_k)
@@ -479,6 +575,21 @@ def get_locked_data(query_text):
 def get_company_data(company_name):
     if not company_name:
         return None
+    # 优先使用用户上传的财务数据
+    for _uc in st.session_state.get("uploaded_companies") or []:
+        _uname = _uc.get("name", "")
+        if company_name in _uname or _uname in company_name:
+            return {
+                "name": _uname,
+                "industry": _uc.get("industry", ""),
+                "year": str(_uc.get("year", "用户上传")),
+                "roe": float(_uc.get("roe", 0) or 0),
+                "margin": float(_uc.get("margin", 0) or 0),
+                "turnover": float(_uc.get("turnover", 0) or 0),
+                "multiplier": float(_uc.get("multiplier", 1.5) or 1.5),
+                "cash": float(_uc.get("cash", 0) or 0),
+                "pain_point": _uc.get("pain_point", "用户上传数据，未标注核心痛点"),
+            }
     try:
         conn = sqlite3.connect("financial_research.db")
         cursor = conn.cursor()
@@ -532,6 +643,16 @@ def extract_report_data(raw_report):
         except Exception:
             pass
     return clean_text, dynamic_data
+
+def chart_pdf_bytes(fig):
+    """把 Plotly 图导出为 PDF 字节；环境缺少 kaleido 时返回 None，不阻塞页面渲染。"""
+    try:
+        buf = io.BytesIO()
+        fig.write_image(file=buf, format="pdf")
+        return buf.getvalue()
+    except Exception:
+        return None
+
 
 def get_rag_context(query_text, top_k=2):
     """
@@ -607,8 +728,35 @@ if 'current_report' not in st.session_state: st.session_state['current_report'] 
 if 'current_query' not in st.session_state: st.session_state['current_query'] = ""
 if 'current_data' not in st.session_state: st.session_state['current_data'] = {}
 
+# --- 产品化功能状态初始化（示例引导 / 上传 / 收藏 / 使用看板） ---
+pf.init_product_state()
+
 # --- 6. 侧边栏 ---
 with st.sidebar:
+    # 上传年报 / 财务数据表（可选）
+    with st.expander("📤 上传年报 / 财务数据表（可选）"):
+        up_file = st.file_uploader(
+            "支持 PDF（年报）或 XLSX / CSV（财务数据表）",
+            type=["pdf", "xlsx", "csv"],
+            key="upload_file",
+        )
+        if up_file is not None:
+            _fid = f"{up_file.name}_{up_file.size}"
+            if st.session_state.get("uploaded_file_id") != _fid:
+                st.session_state["uploaded_file_id"] = _fid
+                with st.spinner("正在解析上传文件，请稍候..."):
+                    _parse_result = pf.parse_uploaded_file(up_file, client)
+                if _parse_result["error"]:
+                    st.error(_parse_result["error"])
+                st.session_state["uploaded_companies"] = _parse_result["companies"]
+                st.session_state["uploaded_report_text"] = _parse_result["report_text"]
+                if _parse_result["companies"]:
+                    _names = "、".join(c["name"] for c in _parse_result["companies"])
+                    st.success(f"已解析 {len(_parse_result['companies'])} 家公司财务数据：{_names}")
+                if _parse_result["report_text"]:
+                    st.success(f"已提取年报文本 {len(_parse_result['report_text'])} 字，将作为分析参考资料")
+                if not _parse_result["companies"] and not _parse_result["report_text"] and not _parse_result["error"]:
+                    st.warning("未识别到有效字段，请确认表头包含：公司 / ROE / 净利润率 / 资产周转率 / 权益乘数 / 经营现金流")
     st.title("📚 研究历史")
     for idx, h in enumerate(st.session_state['history']):
         if st.button(f"📄 {h['query']}", key=f"h_{idx}"):
@@ -617,11 +765,30 @@ with st.sidebar:
             st.session_state['current_query'] = h['query']
             st.rerun()            
     st.divider()
+    # 收藏列表（产品化：用户留存）
+    st.markdown("### ⭐ 我的收藏")
+    _favs = st.session_state.get("favorites", [])
+    if _favs:
+        for _fi, _fav in enumerate(_favs[:10]):
+            _fc1, _fc2 = st.columns([4, 1])
+            with _fc1:
+                if st.button(f"📌 {_fav['query']}", key=f"fav_load_{_fi}", use_container_width=True):
+                    st.session_state['current_query'] = _fav['query']
+                    st.session_state['current_report'] = _fav['report']
+                    st.session_state['current_data'] = _fav['data']
+                    st.rerun()
+            with _fc2:
+                if st.button("✕", key=f"fav_del_{_fi}"):
+                    pf.delete_favorite(_fav['id'])
+                    st.rerun()
+    else:
+        st.caption("暂无收藏。生成报告后点击「收藏本报告」即可在这里管理。")
     st.title("🛠 启动投研")
     
     research_mode = st.radio(
         "选择分析模式",
-        ["简易模式（快速分析）", "标准模式（专业投研）"]
+        ["简易模式（快速分析）", "标准模式（专业投研）"],
+        key="research_mode"
     )
     
     company_query = ""
@@ -631,37 +798,37 @@ with st.sidebar:
     report_type = "深度研究"
 
     if research_mode == "简易模式（快速分析）":
-        research_target = st.radio("选择研究对象", ["公司", "行业"])
+        research_target = st.radio("选择研究对象", ["公司", "行业"], key="research_target")
         if research_target == "公司":
-            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪")
+            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪", key="company_query")
         else:
-            query = st.text_input("输入行业", placeholder="如：新能源汽车")
+            query = st.text_input("输入行业", placeholder="如：新能源汽车", key="query")
     else:
-        research_target = st.radio("研究对象类型", ["公司", "行业"])
+        research_target = st.radio("研究对象类型", ["公司", "行业"], key="research_target")
         if research_target == "公司":
-            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪")
-            period_type = st.selectbox("选择时间周期类型", ["年度", "季度"])
-            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"])
+            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪", key="company_query")
+            period_type = st.selectbox("选择时间周期类型", ["年度", "季度"], key="period_type")
+            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
             if period_type == "年度":
                 period = f"{year_select}年度"
             else:
-                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"])
+                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"], key="quarter_select")
                 period = f"{year_select}年{quarter_select}"
         else:
-            query = st.text_input("输入行业", placeholder="如：新能源汽车")
-            period_type = st.selectbox("选择时间周期类型", ["年度", "季度", "月度"])
-            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"])
+            query = st.text_input("输入行业", placeholder="如：新能源汽车", key="query")
+            period_type = st.selectbox("选择时间周期类型", ["年度", "季度", "月度"], key="period_type")
+            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
             if period_type == "年度":
                 period = f"{year_select}年度"
             elif period_type == "季度":
-                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"])
+                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"], key="quarter_select")
                 period = f"{year_select}年{quarter_select}"
             else:
-                month_select = st.selectbox("⚙️ 选择月份", ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"])
+                month_select = st.selectbox("⚙️ 选择月份", ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"], key="month_select")
                 period = f"{year_select}年{month_select}"
                 
-        report_type = st.selectbox("报告类型", ["年度策略", "季度跟踪", "专题研究"])
-        purpose = st.selectbox("研究目的", ["投资价值分析", "行业趋势分析", "财务质量分析", "风险评估"])
+        report_type = st.selectbox("报告类型", ["年度策略", "季度跟踪", "专题研究"], key="report_type")
+        purpose = st.selectbox("研究目的", ["投资价值分析", "行业趋势分析", "财务质量分析", "风险评估"], key="purpose")
     
     submit_btn = st.button("🚀 开启 7-Agent 深度协同")
     st.caption("提示：结合本地离线数据仓库及 RAG，无需网络请求，零崩溃风险，需要约1~2分钟。:D")
@@ -700,6 +867,21 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     """
     行业大盘与个股对标协同流水线
     """
+    # 各 Agent 耗时统计（用于使用数据看板）
+    _stage_last_t = time.time()
+    _last_agent = None
+    _orig_status_cb = status_callback
+
+    def _timed_status_cb(agent, state):
+        nonlocal _stage_last_t, _last_agent
+        if state == "running":
+            if _last_agent is not None:
+                pf.record_agent_time(_last_agent, round(time.time() - _stage_last_t, 2))
+            _last_agent = agent
+            _stage_last_t = time.time()
+        _orig_status_cb(agent, state)
+
+    status_callback = _timed_status_cb
     # 🌟 核心修复一：行业智能对齐与自适应路由算法 🌟
     aligned_industry = auto_align_industry(company_name, user_input)
     db_data = get_locked_data(aligned_industry)
@@ -754,6 +936,10 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     # 向量数据库检索 (RAG 闭环)
     log_callback("🔍 [RAG Engine] 正在进行向量库高维度特征检索对齐...")
     rag_context = vector_search(aligned_industry, top_k=3)
+    # 用户上传的年报文本作为补充参考资料进入 RAG 上下文
+    _uploaded_text = st.session_state.get("uploaded_report_text", "")
+    if _uploaded_text:
+        rag_context = rag_context + "\n\n[用户上传年报文本]\n" + _uploaded_text[:5000]
     log_callback("✅ [RAG Engine] 本地向量数据库检索对齐完成！")
     
     # 1. Planner Agent
@@ -1007,6 +1193,8 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
 
     final_text = f"{res_report}\n\n```json\n{json.dumps(chart_data)}\n```"
     log_callback("✅ 工作流执行完毕。智能投研报告及图表已就绪！")
+    if _last_agent is not None:
+        pf.record_agent_time(_last_agent, round(time.time() - _stage_last_t, 2))
     return final_text
 
 # --- 8. “AI驾驶舱”两栏UI布局 ---
@@ -1048,20 +1236,32 @@ with col_main:
     if 'tool_traces' not in st.session_state:
         st.session_state['tool_traces'] = []
 
-    if submit_btn and (query or company_query):
+    _auto_trigger = st.session_state.get("trigger_run", False)
+    st.session_state["trigger_run"] = False
+    if (submit_btn or _auto_trigger) and (query or company_query):
+        _run_started = time.time()
+        _tok_before = dict(st.session_state.get("usage_stats", {}))
         st.session_state['logs_history'] = []
         st.session_state['tool_traces'] = [] # 清空之前的工具调用链痕迹
+        st.session_state['agent_times'] = []  # 清空上一轮的 Agent 耗时
         
-        raw_report = run_research_flow(
-            query,
-            log_callback=append_log,
-            status_callback=update_agent_status,
-            company_name=company_query,
-            period=period,
-            purpose=purpose,
-            report_type=report_type
-        )
+        try:
+            raw_report = run_research_flow(
+                query,
+                log_callback=append_log,
+                status_callback=update_agent_status,
+                company_name=company_query,
+                period=period,
+                purpose=purpose,
+                report_type=report_type
+            )
+        except Exception as _run_error:
+            st.error(f"研究流程执行失败：{_run_error}")
+            st.stop()
+        _run_elapsed = time.time() - _run_started
         clean_text, dynamic_data = extract_report_data(raw_report)
+        if not clean_text or not clean_text.strip():
+            clean_text = "⚠️ 本次研究未能生成报告正文（模型返回为空）。请检查 DeepSeek API 额度是否充足，或稍后重试。"
         
         st.session_state['current_report'] = clean_text
         st.session_state['current_data'] = dynamic_data
@@ -1072,6 +1272,15 @@ with col_main:
             "content": clean_text, 
             "data": dynamic_data
         })
+        # 记录本次运行的使用数据（时长 / token / Agent 耗时）
+        _tok_after = st.session_state.get("usage_stats", {})
+        pf.record_usage(
+            st.session_state['current_query'],
+            _run_elapsed,
+            _tok_after.get("input_tokens", 0) - _tok_before.get("input_tokens", 0),
+            _tok_after.get("output_tokens", 0) - _tok_before.get("output_tokens", 0),
+            st.session_state.get("agent_times", []),
+        )
         
         for agent in ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]:
             st.session_state[f"status_{agent}"] = "success"
@@ -1110,11 +1319,11 @@ with col_main:
                     )
                     st.plotly_chart(fig_comp, use_container_width=True, key="company_dupont_chart")
                     
-                    pdf_buffer_comp = io.BytesIO()
-                    fig_comp.write_image(file=pdf_buffer_comp, format="pdf")
-                    st.download_button(
+                    _comp_pdf = chart_pdf_bytes(fig_comp)
+                    if _comp_pdf is not None:
+                        st.download_button(
                         label="📊 导出杜邦对标图为 PDF",
-                        data=pdf_buffer_comp.getvalue(),
+                        data=_comp_pdf,
                         file_name="dupont_comparison_chart.pdf",
                         mime="application/pdf",
                         key="dl_comp_pdf"
@@ -1125,11 +1334,11 @@ with col_main:
                     fig_pie.update_layout(title="市场集中度 (CR4) 动态格局", height=300, margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_pie, use_container_width=True, key="industry_pie_chart")
                     
-                    pdf_buffer_pie = io.BytesIO()
-                    fig_pie.write_image(file=pdf_buffer_pie, format="pdf")
-                    st.download_button(
+                    _pie_pdf = chart_pdf_bytes(fig_pie)
+                    if _pie_pdf is not None:
+                        st.download_button(
                         label="📊 导出竞争格局图为 PDF",
-                        data=pdf_buffer_pie.getvalue(),
+                        data=_pie_pdf,
                         file_name="market_share_chart.pdf",
                         mime="application/pdf",
                         key="dl_pie"
@@ -1154,11 +1363,11 @@ with col_main:
                     )
                     st.plotly_chart(fig_radar, use_container_width=True, key="company_radar_chart")
                     
-                    pdf_buffer_radar = io.BytesIO()
-                    fig_radar.write_image(file=pdf_buffer_radar, format="pdf")
-                    st.download_button(
+                    _radar_pdf = chart_pdf_bytes(fig_radar)
+                    if _radar_pdf is not None:
+                        st.download_button(
                         label="📈 导出能力对标雷达图为 PDF",
-                        data=pdf_buffer_radar.getvalue(),
+                        data=_radar_pdf,
                         file_name="capability_radar_chart.pdf",
                         mime="application/pdf",
                         key="dl_radar_pdf"
@@ -1171,9 +1380,9 @@ with col_main:
                     fig_growth.update_layout(title="行业市场规模与复合增速图", height=300, yaxis=dict(title="市场规模 (亿元)", side="left"), yaxis2=dict(title="增速 (%)", side="right", overlaying="y", showgrid=False))
                     st.plotly_chart(fig_growth, use_container_width=True, key="industry_growth_chart")
                     
-                    pdf_buffer_growth = io.BytesIO()
-                    fig_growth.write_image(file=pdf_buffer_growth, format="pdf")
-                    st.download_button(label="📈 导出市场规模增速图为 PDF", data=pdf_buffer_growth.getvalue(), file_name="market_growth_chart.pdf", mime="application/pdf", key="dl_growth")
+                    _growth_pdf = chart_pdf_bytes(fig_growth)
+                    if _growth_pdf is not None:
+                        st.download_button(label="📈 导出市场规模增速图为 PDF", data=_growth_pdf, file_name="market_growth_chart.pdf", mime="application/pdf", key="dl_growth")
 
             # --- 🌟 新增：多智能体工具与数据库自研 Trace 监控组件 🌟 ---
             if st.session_state['tool_traces']:
@@ -1243,11 +1452,11 @@ with col_main:
                 )
                 st.plotly_chart(fig_trend, use_container_width=True, key="industry_trend_chart")
                 
-                pdf_buffer_trend = io.BytesIO()
-                fig_trend.write_image(file=pdf_buffer_trend, format="pdf")
-                st.download_button(
+                _trend_pdf = chart_pdf_bytes(fig_trend)
+                if _trend_pdf is not None:
+                    st.download_button(
                     label="📉 导出财务趋势折线图为 PDF",
-                    data=pdf_buffer_trend.getvalue(),
+                    data=_trend_pdf,
                     file_name="financial_trend_chart.pdf",
                     mime="application/pdf",
                     key="dl_trend"
@@ -1269,11 +1478,11 @@ with col_main:
                 )
                 st.plotly_chart(fig_cap, use_container_width=True, key="capability_comparison_chart")
                 
-                pdf_buffer_cap = io.BytesIO()
-                fig_cap.write_image(file=pdf_buffer_cap, format="pdf")
-                st.download_button(
+                _cap_pdf = chart_pdf_bytes(fig_cap)
+                if _cap_pdf is not None:
+                    st.download_button(
                     label="📊 导出核心能力对比图为 PDF",
-                    data=pdf_buffer_cap.getvalue(),
+                    data=_cap_pdf,
                     file_name="capability_comparison_chart.pdf",
                     mime="application/pdf",
                     key="dl_cap"
@@ -1304,6 +1513,33 @@ with col_main:
             st.markdown('</div>', unsafe_allow_html=True)
 
         # B. 研报正文展示
+        # A+. 使用数据看板（产品运营视角：数据驱动）
+        with st.expander("📊 使用数据看板", expanded=False):
+            _usage_history = st.session_state.get("usage_history", [])
+            _total_runs = len(_usage_history)
+            _total_in = sum(int(r.get("tokens_in", 0) or 0) for r in _usage_history)
+            _total_out = sum(int(r.get("tokens_out", 0) or 0) for r in _usage_history)
+            _avg_dur = round(sum(float(r.get("duration_sec", 0) or 0) for r in _usage_history) / _total_runs, 1) if _total_runs else 0.0
+            _est_cost = pf.estimate_cost(_total_in, _total_out)
+            _um1, _um2, _um3, _um4 = st.columns(4)
+            _um1.metric("累计研究次数", f"{_total_runs} 次")
+            _um2.metric("平均生成耗时", f"{_avg_dur} 秒")
+            _um3.metric("累计 Token 用量", f"{_total_in + _total_out:,}")
+            _um4.metric("估算调用成本", f"¥{_est_cost:.4f}")
+            _agg_times = {}
+            for _r in _usage_history:
+                for _t in _r.get("agent_times", []):
+                    _a = _t.get("agent", "未知")
+                    _agg_times.setdefault(_a, []).append(float(_t.get("seconds", 0) or 0))
+            if _agg_times:
+                _agent_names = ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]
+                _names_show = [a for a in _agent_names if a in _agg_times]
+                _avgs_show = [round(sum(_agg_times[a]) / len(_agg_times[a]), 2) for a in _names_show]
+                _fig_usage = go.Figure(data=[go.Bar(x=_names_show, y=_avgs_show, marker_color="#2563eb", text=_avgs_show, textposition="outside")])
+                _fig_usage.update_layout(title="各 Agent 平均耗时（秒）", height=260, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(_fig_usage, use_container_width=True, key="usage_agent_chart")
+            else:
+                st.caption("完成一次研究后，这里会展示各 Agent 的耗时分布。")
         st.markdown('<div class="report-container">', unsafe_allow_html=True)
         st.markdown(st.session_state['current_report'])
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1335,11 +1571,11 @@ with col_main:
             )
             st.plotly_chart(fig_risk_radar, use_container_width=True, key="risk_radar_chart_bottom")
             
-            pdf_buffer_risk = io.BytesIO()
-            fig_risk_radar.write_image(file=pdf_buffer_risk, format="pdf")
-            st.download_button(
+            _risk_pdf = chart_pdf_bytes(fig_risk_radar)
+            if _risk_pdf is not None:
+                st.download_button(
                 label="🚩 导出风险雷达图为 PDF 矢量图",
-                data=pdf_buffer_risk.getvalue(),
+                data=_risk_pdf,
                 file_name="risk_radar_chart.pdf",
                 mime="application/pdf",
                 key="dl_risk_radar"
@@ -1347,6 +1583,38 @@ with col_main:
             st.markdown('</div>', unsafe_allow_html=True)
 
         # C. 升级后的 Word 文档导出逻辑（动态嵌入对比图及证据链）
+        # B+. 收藏与分享（产品化功能：用户留存与传播）
+        st.divider()
+        _fc1, _fc2, _fc3 = st.columns(3)
+        with _fc1:
+            if st.button("⭐ 收藏本报告", key="fav_save", use_container_width=True):
+                _fav_item = pf.add_favorite(
+                    st.session_state['current_query'],
+                    st.session_state['current_report'],
+                    st.session_state['current_data'],
+                )
+                st.session_state["share_link"] = f"{pf.APP_URL}?report={_fav_item['id']}"
+                st.toast(f"已收藏《{st.session_state['current_query']}》")
+        with _fc2:
+            if st.button("🔗 生成分享链接", key="fav_share", use_container_width=True):
+                _favs_now = st.session_state.get("favorites", [])
+                if _favs_now:
+                    _fav_item = _favs_now[0]
+                else:
+                    _fav_item = pf.add_favorite(
+                        st.session_state['current_query'],
+                        st.session_state['current_report'],
+                        st.session_state['current_data'],
+                    )
+                st.session_state["share_link"] = f"{pf.APP_URL}?report={_fav_item['id']}"
+        with _fc3:
+            if st.button("📋 复制分享文案", key="fav_copy", use_container_width=True):
+                st.session_state["share_text"] = pf.build_share_text(st.session_state['current_query'])
+        if st.session_state.get("share_link"):
+            st.code(st.session_state["share_link"], language=None)
+            st.caption("对方打开该链接即可直接看到这份报告（收藏保存在当前部署实例，重新部署后需重新收藏）")
+        if st.session_state.get("share_text"):
+            st.text_area("分享文案（可直接复制）", st.session_state["share_text"], height=110, key="share_text_area")
         doc = Document()
         doc.add_heading(f"{st.session_state['current_query']} 深度战略研报", level=1)
         doc.add_paragraph("本报告由 SQLite 本地数据库及企业离线镜像真实数据锚定，并经由多智能体协同校验输出。")
@@ -1412,5 +1680,29 @@ with col_main:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
     else:
-        st.info("👈 请在左侧输入调研课题并启动多智能体系统。运行结果与财务真实数据校验后将在中间主面板完整呈现。")
+        # 首屏示例问题（一键填充，降低使用门槛）
+        def _apply_example(ex):
+            st.session_state["research_mode"] = "标准模式（专业投研）"
+            st.session_state["research_target"] = ex["target"]
+            st.session_state["company_query"] = ex["company"]
+            st.session_state["query"] = ex["query"]
+            st.session_state["period_type"] = ex["period_type"]
+            st.session_state["year_select"] = ex["year"]
+            st.session_state["report_type"] = ex["report_type"]
+            st.session_state["purpose"] = ex["purpose"]
+            st.session_state["trigger_run"] = True
+
+        st.markdown("### 🚀 不知道从哪开始？试试这些示例")
+        st.caption("点击任意示例，系统会自动填好参数并开始研究（首次运行约 1~2 分钟）")
+        _ex_cols = st.columns(len(pf.EXAMPLE_QUESTIONS))
+        for _ei, _ex in enumerate(pf.EXAMPLE_QUESTIONS):
+            with _ex_cols[_ei]:
+                st.button(
+                    _ex["label"],
+                    key=f"example_{_ei}",
+                    use_container_width=True,
+                    on_click=_apply_example,
+                    args=(_ex,),
+                )
+        st.info("💡 也可以从左侧手动输入公司或行业，选择时间周期与研究目的后启动。")
 
