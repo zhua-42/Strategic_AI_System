@@ -9,5 +9,5 @@ kaleido==0.2.1
 akshare>=1.18.0
 pandas>=2.0.0
 pdfplumber
-chromadb>=0.5.0
+chromadb>=0.5.0,<0.6.0
 sentence-transformers>=2.7.0

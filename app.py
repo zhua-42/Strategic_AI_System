@@ -344,14 +344,32 @@ def load_embedding_model():
     return None
 
 
+@st.cache_resource(show_spinner=False)
 def get_vector_db_and_model():
     with st.spinner("正在准备 AI 检索能力，请稍候（若网络受限会自动切换为快速模式）..."):
         model = load_embedding_model()
     if model is None:
         return None, None
-    v_client = chromadb.PersistentClient(path="./vector_db")
-    coll = v_client.get_or_create_collection(name="financial_knowledge")
-    
+    try:
+        v_client = chromadb.PersistentClient(
+            path=os.path.abspath("vector_db"),
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
+        coll = v_client.get_or_create_collection(name="financial_knowledge")
+    except Exception as e:
+        # 云端偶发的 chromadb 内部缓存冲突：清掉共享缓存重试一次
+        try:
+            from chromadb.api.shared_system_client import SharedSystemClient
+            SharedSystemClient.clear_system_cache()
+            v_client = chromadb.PersistentClient(
+                path=os.path.abspath("vector_db"),
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
+            coll = v_client.get_or_create_collection(name="financial_knowledge")
+        except Exception as e2:
+            print(f"[RAG] 向量数据库初始化失败，已降级为关键词检索。{e} / {e2}")
+            return None, None
+
     knowledge_dir = "knowledge"
     if os.path.exists(knowledge_dir) and coll.count() == 0:
         for root, dirs, files in os.walk(knowledge_dir):
@@ -368,7 +386,7 @@ def get_vector_db_and_model():
                     elif filename.endswith(".txt"):
                         with open(filepath, "r", encoding="utf-8") as f:
                             text_content = f.read()
-                    
+
                     if text_content:
                         chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
                         if chunks:
@@ -383,7 +401,7 @@ def get_vector_db_and_model():
 embedding_model, collection = get_vector_db_and_model()
 
 if embedding_model is None:
-    st.sidebar.info("当前为“关键词检索”模式：AI 语义模型未加载成功，网页功能不受影响。将模型文件放入 models/ 文件夹后重启，即可升级为更智能的语义检索。")
+    st.sidebar.info("当前为“关键词检索”模式：语义检索组件未就绪（模型未加载或向量库初始化失败），网页功能不受影响。")
 
 def vector_search(query_text, top_k=3):
     # 向量库不可用（如模型未下载成功）时，降级为关键词检索
