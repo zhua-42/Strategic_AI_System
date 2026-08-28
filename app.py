@@ -21,6 +21,9 @@ import industry_chain_data as icd
 import report_export as rex
 import data_updater as du
 import learning_data as ldata
+import news_fetcher as nf
+import web_reader as wr
+import leader_compare as lc
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -364,19 +367,29 @@ def get_vector_db_and_model():
     coll = v_client.get_or_create_collection(name="financial_knowledge")
     
     knowledge_dir = "knowledge"
-    if os.path.exists(knowledge_dir) and coll.count() == 0:
+    if os.path.exists(knowledge_dir):
+        # 已索引文件名集合（增量索引：新学习资料自动入向量库）
+        indexed = set()
+        try:
+            _existing = coll.get(include=["metadatas"])
+            for _m in (_existing.get("metadatas") or []):
+                indexed.add(_m.get("source", ""))
+        except Exception:
+            _existing = {}
         for root, dirs, files in os.walk(knowledge_dir):
             for filename in files:
-                filepath = os.path.join(root, filename)
-                if filename.endswith(".xlsx") or filename.endswith(".xls") or filename.endswith(".csv"):
+                if filename.endswith((".xlsx", ".xls", ".csv", ".db")):
                     continue
+                if filename in indexed:
+                    continue
+                filepath = os.path.join(root, filename)
                 text_content = ""
                 try:
                     if filename.endswith(".pdf"):
                         with pdfplumber.open(filepath) as pdf:
                             for page in pdf.pages:
                                 text_content += page.extract_text() or ""
-                    elif filename.endswith(".txt"):
+                    elif filename.endswith((".txt", ".md")):
                         with open(filepath, "r", encoding="utf-8") as f:
                             text_content = f.read()
                     
@@ -529,6 +542,34 @@ financial_tools = [
                 "required": ["free_cash_flow", "growth_rate", "wacc"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_latest_news",
+            "description": "搜索某公司/行业的最新新闻与公告（东方财富公告/快讯/搜狗/财新，实时公开信息）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键词（公司名或行业名）"}
+                },
+                "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_webpage_charts",
+            "description": "读取指定网页的文字、表格与内嵌图表数据（ECharts/Chart.js/Highcharts/JSON 数据块）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "网页 URL"}
+                },
+                "required": ["url"]
+            }
+        }
     }
 ]
 
@@ -543,6 +584,23 @@ def execute_financial_tool(tool_name, args):
             growth_rate=args.get("growth_rate"),
             wacc=args.get("wacc")
         )
+    elif tool_name == "search_latest_news":
+        _kw = str(args.get("keyword", "")).strip()
+        _b = nf.fetch_news_bundle(keyword=_kw, company_name=_kw, industry=_kw,
+                                  days=30, limit_each=5)
+        return json.dumps({"工具": "search_latest_news", "关键词": _kw,
+                           "结果数": len(_b.get("items", [])),
+                           "新闻与公告": _b.get("items", [])[:8]}, ensure_ascii=False)
+    elif tool_name == "read_webpage_charts":
+        _u = str(args.get("url", "")).strip()
+        _pg = wr.read_webpage(_u, timeout=10)
+        return json.dumps({"工具": "read_webpage_charts", "网址": _u,
+                           "标题": _pg.get("title", ""),
+                           "正文摘要": (_pg.get("text") or "")[:600],
+                           "表格数": len(_pg.get("tables", [])),
+                           "表格": _pg.get("tables", [])[:2],
+                           "图表数据": _pg.get("charts", [])[:5],
+                           "图片说明": _pg.get("images", [])[:5]}, ensure_ascii=False)
     return "未知工具"
 
 # 从 SQLite 数据库检索行业基准
@@ -787,9 +845,19 @@ def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, r
                       "suggest": "上传政策原文/风险事件清单（PDF/TXT）即可入库"})
 
     # 共同项
-    gaps.append({"item": "最新新闻与公告", "status": "missing" if not rag_ok else "partial",
-                  "reason": "免费新闻接口不稳定/被限流；RAG 知识库仅覆盖已上传文档",
-                  "suggest": "上传新闻文本或截图（支持多文件）"})
+    try:
+        import news_fetcher as _nf
+        _news_ok = bool(_nf.fetch_7x24_news(keyword="", pages=1, limit=1).get("items"))
+    except Exception:
+        _news_ok = False
+    if _news_ok:
+        gaps.append({"item": "最新新闻与公告", "status": "ok",
+                      "reason": "系统内置实时抓取：东方财富公告大全 / 7×24快讯 / 搜狗新闻 / 财新，无需付费 API",
+                      "suggest": ""})
+    else:
+        gaps.append({"item": "最新新闻与公告", "status": "partial",
+                      "reason": "实时新闻接口当前不可达（网络受限），系统会自动降级；可上传新闻文本补充",
+                      "suggest": "上传新闻文本或截图（支持多文件）"})
     conn.close()
     return gaps
 
@@ -848,27 +916,28 @@ def get_rag_context(query_text, top_k=2):
     if not os.path.exists(knowledge_dir):
         return "本地 RAG 知识库未装载。"
 
-    for filename in os.listdir(knowledge_dir):
-        filepath = os.path.join(knowledge_dir, filename)
-        text_content = ""
-        try:
-            if filename.endswith(".pdf"):
-                with pdfplumber.open(filepath) as pdf:
-                    for page in pdf.pages:
-                        text_content += page.extract_text() or ""
-            elif filename.endswith(".txt"):
-                with open(filepath, "r", encoding="utf-8") as f:
-                    text_content = f.read()
-            
-            if text_content:
-                chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
-                keywords = [word for word in query_text if len(word) >= 1]
-                for chunk in chunks:
-                    match_score = sum(1.5 for kw in keywords if kw in chunk)
-                    if match_score > 0:
-                        context_chunks.append((match_score, chunk, filename))
-        except Exception as e:
-            print(f"RAG 解析 {filename} 失败: {e}")
+    for root, dirs, files in os.walk(knowledge_dir):
+        for filename in files:
+            filepath = os.path.join(root, filename)
+            text_content = ""
+            try:
+                if filename.endswith(".pdf"):
+                    with pdfplumber.open(filepath) as pdf:
+                        for page in pdf.pages:
+                            text_content += page.extract_text() or ""
+                elif filename.endswith((".txt", ".md")):
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        text_content = f.read()
+                
+                if text_content:
+                    chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
+                    keywords = [word for word in query_text if len(word) >= 1]
+                    for chunk in chunks:
+                        match_score = sum(1.5 for kw in keywords if kw in chunk)
+                        if match_score > 0:
+                            context_chunks.append((match_score, chunk, filename))
+            except Exception as e:
+                print(f"RAG 解析 {filename} 失败: {e}")
             
     context_chunks.sort(key=lambda x: x[0], reverse=True)
     results = context_chunks[:top_k]
@@ -878,6 +947,88 @@ def get_rag_context(query_text, top_k=2):
         
     formatted_context = "\n".join([f"📖 [RAG底稿来源: {r[2]}] {r[1]}" for r in results])
     return formatted_context
+
+# ============================================================
+# 🧠 系统方法库（学习资料注入：网站自身学习调用）
+# ============================================================
+LEARNING_DIR = os.path.join("knowledge", "learning")
+
+# 方法库分域：把入库的学习资料按专业域组织，供各 Agent 自动调用
+METHOD_DOMAINS = {
+    "写作规范": ["行研方法论_研报模版及话术_学习笔记", "行研方法论_深度报告tips_学习笔记"],
+    "研究方法": ["行研方法论_券商行研全流程tips_学习笔记", "行研方法论_行研40问_学习笔记"],
+    "财务分析": ["行研方法论_企业财务报表分析_学习笔记", "Deloitte_Tableau停机分析_学习笔记", "Deloitte_Excel平等分类_学习笔记"],
+    "估值建模": ["Forage_JPMorgan投行_学习笔记", "Forage_Citi金融_学习笔记"],
+    "审计风控": ["Forage_KPMG审计_学习笔记"],
+    "咨询分析": ["Forage_PwC咨询_学习笔记", "Forage_BCG数据科学_学习笔记"],
+}
+
+_METHOD_CACHE = {"loaded": False, "bank": {}}
+
+def load_method_bank():
+    """加载 knowledge/learning 下的学习笔记全文到内存方法库。"""
+    if _METHOD_CACHE["loaded"]:
+        return _METHOD_CACHE["bank"]
+    bank = {}
+    if os.path.isdir(LEARNING_DIR):
+        for fn in os.listdir(LEARNING_DIR):
+            if not fn.endswith(".md"):
+                continue
+            fp = os.path.join(LEARNING_DIR, fn)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    bank[os.path.splitext(fn)[0]] = f.read()
+            except Exception as e:
+                print(f"方法库读取失败 {fn}: {e}")
+    _METHOD_CACHE["bank"] = bank
+    _METHOD_CACHE["loaded"] = True
+    return bank
+
+
+def method_brief(domains, query_hint="", max_chars=1200):
+    """
+    按领域从方法库取资料并检索相关片段，返回 (brief_text, used_titles)。
+    这是 AI 系统学习调用学习资料的统一入口。
+    """
+    bank = load_method_bank()
+    used = []
+    parts = []
+    for domain in domains:
+        for title in METHOD_DOMAINS.get(domain, []):
+            if title not in bank:
+                continue
+            doc = bank[title]
+            # 关键词打分选段
+            lines = [l.strip() for l in doc.replace("。", "。\n").split("\n") if len(l.strip()) > 12]
+            kw = [w for w in (query_hint or "").split() if len(w) >= 2] + ["方法", "框架", "步骤", "模型", "估值", "分析"]
+            scored = []
+            for ln in lines:
+                s = sum(1.0 for k in kw if k in ln)
+                if s > 0:
+                    scored.append((s, ln))
+            scored.sort(key=lambda x: -x[0])
+            top = scored[:6]
+            if top:
+                snippet = " ".join(ln for _, ln in top)[:max_chars]
+                parts.append(f"【{domain} · 学习资料《{title}》】\n{snippet}")
+                used.append(title)
+    if not parts:
+        return "", []
+    brief = "\n\n".join(parts)
+    return brief, used
+
+
+def method_domain_for(research_type, purpose, report_type):
+    """根据当前研究任务选择要注入的方法领域。"""
+    domains = ["研究方法"]
+    if research_type == "公司研究":
+        domains += ["财务分析", "估值建模"]
+    else:
+        domains += ["财务分析"]
+    if "风险" in (purpose or "") or "审计" in (purpose or ""):
+        domains.append("审计风控")
+    domains.append("写作规范")
+    return domains
 
 # --- 4. 界面美化 ---
 st.markdown("""
@@ -952,36 +1103,20 @@ with st.sidebar:
             st.rerun()
         st.caption("说明：实时行情接口受数据源限制不可达；行业财务指标来自东方财富业绩报表全市场聚合，自动按 6 小时缓存。")
 
-    # --- 🌟 学习资料库（Forage / Deloitte / 券商行研方法论） ---
-    with st.expander("📚 学习资料库", expanded=False):
-        if ldata.count_resources() == 0:
-            ldata.scan_and_sync_learning_dir()
-        _lk = st.text_input("🔍 搜索资料", placeholder="如：DCF、审计、行业研究...", key="learn_search")
-        _lt = st.selectbox("按来源筛选", ["全部", "Forage 模拟练习", "Deloitte 案例", "券商行研方法论", "财务分析"], key="learn_tag")
-        _resources = ldata.search_resources(keyword=_lk, tag=None if _lt == "全部" else _lt, limit=60)
-        if not _resources:
-            st.caption("暂无资料。可先「学习资料导入」上传 PDF/MD 入库。")
-        for _lr in _resources:
-            with st.container(border=True):
-                st.markdown(f"**{_lr['title']}**")
-                st.caption(f"来源：{_lr['source'] or '—'} · 类型：{_lr['resource_type']}")
-                if _lr.get("summary"):
-                    st.caption(_lr["summary"][:120] + ("…" if len(_lr["summary"]) > 120 else ""))
-                if _lr.get("file_path") and os.path.exists(os.path.join("knowledge", "learning", _lr["file_path"])):
-                    with open(os.path.join("knowledge", "learning", _lr["file_path"]), "rb") as _f:
-                        st.download_button("⬇️ 下载", _f.read(),
-                                           file_name=_lr["file_path"],
-                                           mime="application/octet-stream",
-                                           key=f"learn_dl_{_lr['id']}")
-        with st.expander("🏗️ 学习资料导入（入库教学资料）", expanded=False):
+    # --- 🧠 系统方法论知识库（仅内部学习调用，不对访客开放浏览） ---
+    with st.expander("🧠 系统方法论知识库（内部）", expanded=False):
+        st.caption("系统内置 Forage 案例与券商行研方法论知识库，仅供 AI 投研 Agent "
+                   "按研究任务内部检索调用（学习方法论/写作规范），不对外提供浏览与下载。")
+        with st.expander("📥 入库新资料（管理员）", expanded=False):
             _lup = st.file_uploader("PDF / MD / TXT", type=["pdf", "md", "txt"], key="learn_upload")
-            if _lup is not None and st.button("入库", key="learn_upload_btn"):
+            if _lup is not None and st.button("入库供系统学习", key="learn_upload_btn"):
                 os.makedirs("knowledge/learning", exist_ok=True)
                 with open(os.path.join("knowledge", "learning", _lup.name), "wb") as _fh:
                     _fh.write(_lup.getvalue())
                 ldata.upsert_resource(os.path.splitext(_lup.name)[0], "用户上传", "markdown" if not _lup.name.lower().endswith(".pdf") else "pdf",
                                       "", ["用户上传"], _lup.name, _lup.size)
-                st.success(f"已入库：{_lup.name}")
+                load_method_bank()
+                st.success(f"已入库：{_lup.name}（下次研究时系统将自动检索调用）")
                 st.rerun()
 
     st.title("📚 研究历史")
@@ -1112,6 +1247,46 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     # 🌟 核心修复一：行业智能对齐与自适应路由算法 🌟
     aligned_industry = auto_align_industry(company_name, user_input)
     db_data = get_locked_data(aligned_industry)
+
+    # 📰 实时新闻与公告抓取（网站自身搜索能力：公告/快讯/网络搜索）
+    log_callback("📰 [News Engine] 正在抓取实时新闻与公告（东方财富/搜狗/财新）...")
+    _news_kw = company_name or aligned_industry
+    _news_bundle = nf.fetch_news_bundle(company_name=company_name, industry=aligned_industry,
+                                        keyword=_news_kw, days=30, limit_each=8)
+    news_items = _news_bundle.get("items", []) or []
+    log_callback(f"📰 [News Engine] 抓取到 {len(news_items)} 条实时新闻/公告（{_news_bundle.get('note', '')}）")
+
+    # 🌐 网页图表数据读取（当新闻带链接时，尝试读取正文/表格/图表数据）
+    web_page_summary = ""
+    for _nit in news_items[:3]:
+        _u = _nit.get("url", "")
+        if _u and _u.startswith("http"):
+            _pg = wr.read_webpage(_u, timeout=8)
+            if _pg.get("ok"):
+                web_page_summary = wr.format_page_summary(_pg, max_text=900)
+                break
+    if web_page_summary:
+        log_callback("🌐 [Web Reader] 已读取新闻网页正文/表格/图表数据，将作为研报参考。")
+    else:
+        log_callback("🌐 [Web Reader] 暂无可用网页详情（网络受限时跳过，不影响主流程）。")
+
+    # 🏆 龙头公司横向对比（3~4 家，真实财务摘要 + 兜底基准）
+    leader_payload = lc.build_leader_payload(aligned_industry)
+    if leader_payload.get("ok"):
+        log_callback(f"🏆 [Leader Compare] 龙头对比已生成：{'、'.join(leader_payload.get('companies', [])[:4])}")
+
+    # 🧠 系统方法库调用：按研究任务自动检索注入学习资料（Forage 案例 + 行研方法论）
+    _rt = "公司研究" if company_name else "行业研究"
+    _method_domains = method_domain_for(_rt, purpose, report_type)
+    _method_brief, _method_used = method_brief(
+        _method_domains,
+        query_hint=f"{company_name or ''} {aligned_industry} {purpose or ''} {report_type or ''}",
+    )
+    if _method_used:
+        ldata.mark_used(_method_used, "Method Bank")
+        log_callback(f"🧠 [Method Bank] 系统方法库已检索调用 {len(_method_used)} 份学习资料：{'、'.join(_method_used[:6])}")
+    else:
+        log_callback("🧠 [Method Bank] 系统方法库暂无匹配该任务的资料（可上传补充）。")
     
     # 重新加载 Data Retrieval Agent 避免白酒行业污染
     research_requirement = query_understanding_agent(aligned_industry, company_name, period, purpose, report_type)
@@ -1145,7 +1320,12 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         请进行深度审计并调用对应工具：
         1. 必须调用 `calculate_dcf` 工具对该个股进行内在价值估算。你可以使用公司的当前经营现金流 {company_data['cash']} 万元作为 free_cash_flow。假设增长率为 0.12 (12%)，WACC折现率为 0.085 (8.5%)。
         2. 针对其研究目的【{purpose}】，利用杜邦三要素进行拆解，指出其财务偏离行业基准的主要驱动力量。
+        3. 如需要可调用 `search_latest_news` 检索公司最新动态、`read_webpage_charts` 读取相关网页数据。
         """
+        if _method_brief:
+            financial_prompt += f"\n\n【系统方法库·学习资料参考（估值/财务分析案例方法）】\n{_method_brief[:1800]}"
+        if news_items:
+            financial_prompt += f"\n\n【实时新闻与公告（可引用）】\n{nf.format_items_markdown(news_items, max_items=6)}"
     else:
         log_callback(f"🔑 [Database] 已锁死行业大盘数据。数据来源: {db_data['data_source']}，时间跨度: {period}")
         financial_prompt = f"""
@@ -1159,6 +1339,10 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         分析周期为【{period}】，研究偏好为【{purpose}】。
         请分析该行业在【{period}】内的杜邦三要素驱动机制，尤其是其【{purpose}】维度下的财务质量表现。
         """
+        if _method_brief:
+            financial_prompt += f"\n\n【系统方法库·学习资料参考（财务分析框架）】\n{_method_brief[:1800]}"
+        if news_items:
+            financial_prompt += f"\n\n【实时新闻与公告（可引用）】\n{nf.format_items_markdown(news_items, max_items=6)}"
 
     # 向量数据库检索 (RAG 闭环)
     log_callback("🔍 [RAG Engine] 正在进行向量库高维度特征检索对齐...")
@@ -1174,15 +1358,37 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
     time.sleep(1)
     
-    # 2. Research Agent
+    # 2. Research Agent（支持实时新闻/网页图表工具）
     status_callback("Research", "running")
     log_callback("🔍 [Research Agent] 查询大盘，融合数据库，构建竞争集中度 (CR4) 指标...")
     research_prompt = f"根据以下行业数据库信息，结合研究周期【{period}】完成行业竞争格局分析。行业: {db_data['industry_name']}, CR4: {db_data['cr4']}%"
-    res_research = client.chat.completions.create(
+    if _method_brief:
+        research_prompt += f"\n\n【系统方法库·学习资料参考】\n{_method_brief[:1500]}"
+    if news_items:
+        research_prompt += f"\n\n【实时新闻与公告（可引用最新动态）】\n{nf.format_items_markdown(news_items, max_items=8)}"
+    _research_messages = [{"role": "user", "content": research_prompt}]
+    _res_r = client.chat.completions.create(
         model="deepseek-chat",
-        messages=[{"role":"user", "content":research_prompt}],
+        messages=_research_messages,
+        tools=financial_tools,
         temperature=0.3
-    ).choices[0].message.content
+    )
+    _res_msg = _res_r.choices[0].message
+    if getattr(_res_msg, "tool_calls", None):
+        _research_messages.append(_res_msg)
+        for _tc in _res_msg.tool_calls:
+            _tname = _tc.function.name
+            _targs = json.loads(_tc.function.arguments)
+            log_callback(f"🛠️ [Research Tool] 触发 {_tname} 工具调用！")
+            _tresult = execute_financial_tool(_tname, _targs)
+            _research_messages.append({"role": "tool", "tool_call_id": _tc.id, "content": _tresult})
+        res_research = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=_research_messages,
+            temperature=0.3
+        ).choices[0].message.content
+    else:
+        res_research = _res_msg.content
     
     # 3. Financial Agent (支持 DCF 工具调用)
     status_callback("Financial", "running")
@@ -1220,19 +1426,22 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     else:
         res_financial = message.content
 
-    # 4. Policy Agent
+    # 4. Policy Agent（注入最新新闻/公告与网页数据作为政策背景）
     status_callback("Policy", "running")
     log_callback("📜 [Policy Agent] 精细化政策拆解：行业限制、税收优惠及环保壁垒...")
-    policy_prompt = f"针对 '{aligned_industry}'，请详述其面临的最新行业准入门槛及绿色金融支持力度。参考底稿: {rag_context}"
+    _news_ctx = nf.format_items_markdown(news_items, max_items=6) if news_items else "（无实时新闻）"
+    policy_prompt = (f"针对 '{aligned_industry}'，请详述其面临的最新行业准入门槛及绿色金融支持力度。"
+                     f"参考底稿: {rag_context}\n\n【最新新闻与公告（实时抓取，可引用）】\n{_news_ctx}")
     res_policy = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": policy_prompt}]
     ).choices[0].message.content
 
-    # 5. Risk Agent
+    # 5. Risk Agent（注入实时新闻/公告中的风险事件线索）
     status_callback("Risk", "running")
     log_callback("🚩 [Risk Agent] 核心风险扫描...")
-    risk_prompt = f"请分析：行业: {db_data['industry_name']}的财务与政策风险。参考底稿: {rag_context}"
+    risk_prompt = (f"请分析：行业: {db_data['industry_name']}的财务与政策风险。参考底稿: {rag_context}"
+                   f"\n\n【最新新闻与公告（实时抓取，注意其中的风险线索：处罚/诉讼/减持/监管问询等）】\n{_news_ctx}")
     res_risk = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": risk_prompt}],
@@ -1330,41 +1539,64 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     # 7. Report Agent
     status_callback("Report", "running")
     log_callback("✍️ [Report Agent] 研报总装中，整合对标成果与 RAG 深度分析...")
+    _write_brief, _write_used = method_brief(["写作规范"], query_hint=f"{aligned_industry} 研报 {report_type}")
+    if _write_used:
+        ldata.mark_used(_write_used, "Report Agent")
+        log_callback(f"🧠 [Method Bank] Report Agent 调用写作规范资料 {len(_write_used)} 份")
+
+    # 新闻/公告/网页图表数据注入研报（最新动态 + 来源链接）
+    _news_md = nf.format_items_markdown(news_items, max_items=8) if news_items else "（实时新闻接口暂不可达，建议上传新闻文本补充）"
+    _leader_md = lc.format_leader_markdown(aligned_industry) if leader_payload.get("ok") else "（该行业暂无龙头对比数据）"
+
     report_prompt = f"""
-    你是一名卖方证券研究所首席分析师（参考券商行研深度报告方法论）。
+    你是一名卖方证券研究所首席分析师（参考券商行研深度报告方法论《行业分析模版》与《公司分析模版》）。
     请根据以下研究材料，生成一篇定位为【{report_type}】、研究目的侧重于【{purpose}】、时间跨度锚定在【{period}】的标准深度研究报告。
-    写作要求（券商行研方法论）：
+    写作要求（券商行研方法论，严格对齐行研模版结构）：
     1. 结论先行：开头 100-200 字给出核心观点（评级/结论/风险一句），正文再展开论证；
-    2. 数据说话：每个核心论点尽量附数据（% / 倍 / 亿元），并指明来源（行业聚合/公司财报/政策底稿）；
-    3. 结构完整：按 一、核心观点；二、市场/行业回顾；三、基本面与估值；四、细分赛道；五、产业链；六、政策合规；七、投资建议与盈利预测；八、风险提示 输出；
+    2. 数据说话：每个核心论点尽量附数据（% / 倍 / 亿元），并指明来源（行业聚合/公司财报/政策底稿/实时新闻）；
+    3. 结构完整（行业研究模版：核心观点 → 行情回顾/行业表现（含图表佐证与涨跌幅/PE-PB分位）→ 细分板块分析（选 4~6 个热门板块，含关键财务数据/核心驱动/典型企业）→ 产业链传导（上游成本→中游制造→下游需求）→ 行业事件/新闻 → 投资策略与盈利预测（核心假设）→ 风险提示（若XX发生→将导致XX结果句式）；
+       公司研究模版：核心观点 → 市场位势（营收排名/市占率/增速对比/行业集中度）→ 盈利能力与定价权（毛利率/净利率 vs 行业均值/产品差异化/价格轨迹）→ 供应链话语权（应付/应收/存货周转）→ 成长后劲（管线/研发/产能）→ 政策抗性（集采/医保敞口）→ 经营效率（人均产出/费用控制）→ 风险提示）；
     4. 话术规范：客观审慎，避免绝对化表述；估值与预测给出假设条件；
-    5. 结尾必须给出「免责声明」。篇幅 1200-2000 字。
+    5. 必须引用「最新新闻与公告」与「龙头公司横向对比」两大板块（见下方实时数据）；
+    6. 结尾必须给出「免责声明」。篇幅 1200-2000 字。
 
     报告必须整合以下多边对标及辩论博弈结果：
-    
+
     # 一、核心观点
     - 要求：100-200字总结全文，针对【{purpose}】给出核心投资逻辑、内在价值估值结论及多边辩论综述。
-    
+
     # 二、行业行情回顾 (聚焦周期: {period})
-    
+
     # 三、企业内在价值与基本面博弈分析 (结合 Financial 与 Risk 专家博弈点：)
     1. 财务分析依据：{res_financial}
     2. 辩论意见综述：财务立场的{res_debate_fin} 与 风险立场的{res_debate_risk}
-    
+
     # 四、细分赛道分析
-    
-    # 五、产业链分析
-    
+
+    # 五、产业链传导
+
     # 六、政策与行业合规 (RAG政策输入)：
     {res_policy}
-    
+
     # 七、投资策略与盈利预测 (时间周期跨度: {period})
-    
+
     # 八、风险提示 (RAG风险及底线输入)：
     {res_risk}
-    
+
+    ======== 实时新闻与公告（务必引用并标注来源与日期）========
+    {_news_md}
+
+    ======== 龙头公司横向对比（3~4 家，务必引用并简要分析）========
+    {_leader_md}
+
+    ======== 网页数据摘录（新闻正文/表格/图表数据，可引用）========
+    {web_page_summary if web_page_summary else "（无）"}
+
     自评检验结果反馈：
     {res_verifier}
+
+    【系统方法库·写作规范学习资料（必须按此规范执行）】：
+    {_write_brief if _write_brief else "（暂无写作规范资料）"}
     """
     res_report = client.chat.completions.create(
         model="deepseek-chat",
@@ -1403,7 +1635,11 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
             "data_gaps": data_gaps,
             "report_meta": report_meta,
             "market_as_of": as_of,
-            "data_note": "行业毛利/ROE/CR4/净利率为东方财富业绩报表全市场真实聚合；历史序列与市场规模为示意/估算口径，详见缺口说明。"
+            "data_note": "行业毛利/ROE/CR4/净利率为东方财富业绩报表全市场真实聚合；历史序列与市场规模为示意/估算口径，详见缺口说明。",
+            "news_items": news_items,
+            "news_note": _news_bundle.get("note", ""),
+            "leader_data": leader_payload,
+            "web_page_summary": web_page_summary,
         }
     else:
         base_size = 500 if "银" in db_data["industry_name"] or "白酒" in db_data["industry_name"] else 200
@@ -1436,7 +1672,11 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
             "market_as_of": as_of,
             "data_note": "CR4/ROE/净利率/毛利率为真实全市场聚合；历史趋势与市场规模为估算口径，详见缺口说明。",
             "evidence_ledger": evidence_ledger,
-            "locked_source": db_data["data_source"]
+            "locked_source": db_data["data_source"],
+            "news_items": news_items,
+            "news_note": _news_bundle.get("note", ""),
+            "leader_data": leader_payload,
+            "web_page_summary": web_page_summary,
         }
 
     final_text = f"{res_report}\n\n```json\n{json.dumps(chart_data)}\n```"
@@ -1652,6 +1892,7 @@ with col_main:
                         barmode='group', height=300, margin=dict(l=10, r=10, t=40, b=10)
                     )
                     st.plotly_chart(fig_comp, use_container_width=True, key="company_dupont_chart")
+                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）· 东方财富业绩报表")
                     
                     _comp_pdf = chart_pdf_bytes(fig_comp)
                     if _comp_pdf is not None:
@@ -1667,6 +1908,7 @@ with col_main:
                     fig_pie = go.Figure(data=[go.Pie(labels=share_data["labels"], values=share_data["values"], hole=.4)])
                     fig_pie.update_layout(title="市场集中度 (CR4) 动态格局", height=300, margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_pie, use_container_width=True, key="industry_pie_chart")
+                    st.caption(f"📚 数据来源：东方财富业绩报表全市场聚合（报告期 {data.get('market_as_of', '—')}）· CR4={share_data['values'][0]}%")
                     
                     _pie_pdf = chart_pdf_bytes(fig_pie)
                     if _pie_pdf is not None:
@@ -1696,6 +1938,7 @@ with col_main:
                         title="标的公司与行业能力多维透视", height=300, margin=dict(l=10, r=10, t=40, b=10)
                     )
                     st.plotly_chart(fig_radar, use_container_width=True, key="company_radar_chart")
+                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）与行业聚合值（{data.get('market_as_of', '')}）")
                     
                     _radar_pdf = chart_pdf_bytes(fig_radar)
                     if _radar_pdf is not None:
@@ -1713,10 +1956,47 @@ with col_main:
                     fig_growth.add_trace(go.Scatter(x=growth_data["years"], y=growth_data["growth_rate"], name="增速 (%)", yaxis="y2", mode="lines+markers", line=dict(color="#ef4444", width=3)))
                     fig_growth.update_layout(title="行业市场规模与复合增速图", height=300, yaxis=dict(title="市场规模 (亿元)", side="left"), yaxis2=dict(title="增速 (%)", side="right", overlaying="y", showgrid=False))
                     st.plotly_chart(fig_growth, use_container_width=True, key="industry_growth_chart")
+                    st.caption("📚 数据来源：市场规模/增速为估算口径（公开区间）；CR4/ROE/净利率/毛利率为东方财富业绩报表真实聚合")
                     
                     _growth_pdf = chart_pdf_bytes(fig_growth)
                     if _growth_pdf is not None:
                         st.download_button(label="📈 导出市场规模增速图为 PDF", data=_growth_pdf, file_name="market_growth_chart.pdf", mime="application/pdf", key="dl_growth")
+
+            # --- 🌟 公司模式新增：杜邦 ROE 差距归因瀑布图（需求：更多图表类型） ---
+            if is_company_mode:
+                import math as _math
+                _wf_labels = ["行业ROE", "利润率贡献", "周转率贡献", "杠杆贡献", "公司ROE"]
+                def _ln(v):
+                    return _math.log(max(float(v), 0.01))
+                try:
+                    _wf_dm = _ln(data["company_margin"]) - _ln(data["industry_margin"])
+                    _wf_dt = _ln(data["company_turnover"]) - _ln(data["industry_turnover"])
+                    _wf_dl = _ln(data["company_multiplier"]) - _ln(data["industry_multiplier"])
+                except Exception:
+                    _wf_dm = _wf_dt = _wf_dl = 0.0
+                _wf_vals = [data["industry_roe"], _wf_dm, _wf_dt, _wf_dl, data["company_roe"]]
+                _wf_fig = go.Figure()
+                _wf_bottoms = [0, data["industry_roe"], data["industry_roe"] + _wf_dm,
+                               data["industry_roe"] + _wf_dm + _wf_dt, 0]
+                for _i, (_lb, _v, _bt) in enumerate(zip(_wf_labels, _wf_vals, _wf_bottoms)):
+                    if _i in (1, 2, 3):
+                        _wf_fig.add_trace(go.Bar(x=[_lb], y=[abs(_v)], base=[_bt],
+                                                 marker_color="#86bc25" if _v >= 0 else "#C0392B",
+                                                 text=[f"{_v:+.2f}"], textposition="inside",
+                                                 name="贡献" if _i == 1 else None,
+                                                 showlegend=False))
+                    else:
+                        _wf_fig.add_trace(go.Bar(x=[_lb], y=[abs(_v)], base=[0],
+                                                 marker_color="#0F2A5C" if _i == 0 else "#1F5FA8",
+                                                 text=[f"{_v:.2f}"], textposition="outside",
+                                                 showlegend=False))
+                _wf_fig.update_layout(
+                    title="杜邦 ROE 差距归因（公司 vs 行业 · 对数分解示意）",
+                    height=300, margin=dict(l=10, r=10, t=50, b=10),
+                    yaxis_title="ROE 贡献（百分点/对数）",
+                )
+                st.plotly_chart(_wf_fig, use_container_width=True, key="dupont_waterfall_chart")
+                st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）；分解口径：ln 差线性化示意")
 
             # --- 🌟 新增：多智能体工具与数据库自研 Trace 监控组件 🌟 ---
             if st.session_state['tool_traces']:
@@ -1785,6 +2065,7 @@ with col_main:
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
                 st.plotly_chart(fig_trend, use_container_width=True, key="industry_trend_chart")
+                st.caption("📚 数据来源：最新报告期为东方财富业绩报表真实聚合；历史期为趋势示意（授权数据源缺失）")
                 
                 _trend_pdf = chart_pdf_bytes(fig_trend)
                 if _trend_pdf is not None:
@@ -1811,6 +2092,7 @@ with col_main:
                     margin=dict(l=10, r=10, t=40, b=10)
                 )
                 st.plotly_chart(fig_cap, use_container_width=True, key="capability_comparison_chart")
+                st.caption("📚 数据来源：ROE/毛利率/CR4/净利率为东方财富业绩报表全市场聚合（报告期见数据截止标注）")
                 
                 _cap_pdf = chart_pdf_bytes(fig_cap)
                 if _cap_pdf is not None:
@@ -1822,12 +2104,15 @@ with col_main:
                     key="dl_cap"
                 )
 
-        # 3D 产业链板块（真实环节数据 · 全信息 hover）
+        # 3D 产业链板块（真实环节数据 · 全信息 hover · 每次必现）
         with st.container():
             st.markdown('<div class="chart-box">', unsafe_allow_html=True)
-            st.write("#### 🔗 产业链全景逻辑流（鼠标悬停查看：业务内容 / 龙头企业 / 成本 / 利润率 / 特点）")
+            st.write("#### 🔗 产业链全景逻辑流（鼠标悬停查看：业务内容 / 龙头企业 / 成本 / 利润率 / 特点 / 实时动态）")
             chain = data.get("industry_chain", {})
             nodes = chain.get("nodes", [])
+            # 把实时新闻动态挂到产业链 hover 上（网站自身搜索能力）
+            _chain_news = data.get("news_items", []) or []
+            _chain_news_text = "；".join(f"{it.get('title','')[:40]}" for it in _chain_news[:5]) if _chain_news else "（暂无实时动态）"
             if nodes:
                 stage_color_map = {
                     "upstream": "#2563eb", "midstream": "#0d9488",
@@ -1846,6 +2131,7 @@ with col_main:
                     margin=nd["margin"],
                     features=nd["features"],
                     source=nd["source"],
+                    news=_chain_news_text,
                 ) for nd in nodes]
                 fig_3d = go.Figure(data=[go.Scatter3d(
                     x=xs, y=ys, z=zs,
@@ -1865,6 +2151,7 @@ with col_main:
                         "💰 成本特征：%{customdata.cost}<br>"
                         "📈 利润率：%{customdata.margin}<br>"
                         "✨ 特点：%{customdata.features}<br>"
+                        "📰 实时动态（网站自动检索）：%{customdata.news}<br>"
                         "📚 数据来源：%{customdata.source}<extra></extra>"
                     ),
                 )])
@@ -1884,10 +2171,106 @@ with col_main:
                 if chain.get("matched_industry"):
                     st.caption(f"已匹配行业：**{chain['matched_industry']}** —— {chain.get('note', '')}")
                 else:
-                    st.warning(chain.get("note", "该行业暂无细分产业链数据，建议上传行业研报补充。"))
+                    st.info(chain.get("note", "通用产业链框架（该行业暂未收录细分库），系统已自动检索实时新闻充实动态。"))
+                if _chain_news:
+                    with st.expander("📰 产业链实时动态（网站自动检索，悬停亦可查看）", expanded=False):
+                        for _cn in _chain_news[:8]:
+                            _cu = _cn.get("url", "")
+                            if _cu:
+                                st.markdown(f"- {_cn.get('date','')} **{_cn.get('title','')}**（{_cn.get('source','')}） [链接]({_cu})")
+                            else:
+                                st.markdown(f"- {_cn.get('date','')} **{_cn.get('title','')}**（{_cn.get('source','')}）")
             else:
-                st.info("该行业暂无产业链数据，可在「资料缺口审查」中上传行业研报补充。")
+                st.info("产业链结构构建中……")
             st.markdown('</div>', unsafe_allow_html=True)
+
+        # ============================================================
+        # 🌟 龙头公司横向对比板块（3~4 家龙头 · 真实财务摘要 + 对比图表）
+        # ============================================================
+        _leader = data.get("leader_data", {}) or {}
+        if _leader.get("ok") and _leader.get("companies"):
+            with st.container():
+                st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+                st.write(f"#### 🏆 龙头公司横向对比（{_leader.get('industry', '')} · 3~4 家龙头）")
+                _comps = _leader["companies"]
+                _metrics = _leader.get("metrics", [])
+                _vals = _leader.get("values", {})
+                # 对比表格
+                _ldf = pd.DataFrame({c: _vals.get(c, {}) for c in _comps})
+                _ldf = _ldf.reindex(_metrics)
+                st.dataframe(_ldf, use_container_width=True)
+                # 分组柱状图
+                _fig_leader = go.Figure()
+                _colors = ["#0F2A5C", "#1F5FA8", "#0d9488", "#86bc25", "#E67E22", "#7D5BA6"]
+                for _ci, _c in enumerate(_comps):
+                    _fig_leader.add_trace(go.Bar(
+                        name=_c,
+                        x=_metrics,
+                        y=[_vals.get(_c, {}).get(m, 0) for m in _metrics],
+                        marker_color=_colors[_ci % len(_colors)],
+                    ))
+                _fig_leader.update_layout(
+                    title="龙头公司多指标横向对比（ROE / 毛利率 / 净利率 / 同比 / EPS）",
+                    barmode="group", height=340,
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(_fig_leader, use_container_width=True, key="leader_compare_chart")
+                _notes = _leader.get("notes", {})
+                for _c in _comps:
+                    st.caption(f"**{_c}**：{_notes.get(_c, '')}")
+                st.caption("数据来源：" + "；".join(_leader.get("sources", [])))
+                # 导出按钮
+                _leader_png = rex.render_chart_png("leader_compare", _leader, title="龙头公司横向对比")
+                if _leader_png:
+                    st.download_button("📊 导出龙头对比图为 PNG", data=_leader_png,
+                                       file_name="leader_comparison.png", mime="image/png",
+                                       key="dl_leader_png")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        # ============================================================
+        # 📰 最新新闻与公告板块（网站自身搜索能力 · 实时公开信息）
+        # ============================================================
+        _news_list = data.get("news_items", []) or []
+        if _news_list:
+            with st.container():
+                st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+                st.write(f"#### 📰 最新新闻与公告（实时抓取 · {data.get('news_note', '')}）")
+                st.caption("来源：东方财富公告大全 / 全市场公告 / 7×24快讯 / 搜狗新闻 / 财新网（无需付费 API）")
+                # 来源分布图
+                _src_counter = {}
+                for _n in _news_list:
+                    _s = _n.get("source", "其他")
+                    _src_counter[_s] = _src_counter.get(_s, 0) + 1
+                if _src_counter:
+                    _fig_news = go.Figure(data=[go.Pie(labels=list(_src_counter.keys()),
+                                                       values=list(_src_counter.values()), hole=.45)])
+                    _fig_news.update_layout(title="新闻/公告来源分布", height=280,
+                                            margin=dict(l=10, r=10, t=50, b=10))
+                    st.plotly_chart(_fig_news, use_container_width=True, key="news_source_chart")
+                # 列表（带链接）
+                _ncols = st.columns(2)
+                for _idx, _n in enumerate(_news_list[:12]):
+                    _col = _ncols[_idx % 2]
+                    _t = _n.get("title", "")
+                    _d = _n.get("date", "")
+                    _s = _n.get("source", "")
+                    _u = _n.get("url", "")
+                    _label = f"**{_t[:60]}**　{_d}　（{_s}）"
+                    if _u:
+                        _col.markdown(f"- {_label} [原文]({_u})")
+                    else:
+                        _col.markdown(f"- {_label}")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        # ============================================================
+        # 🌐 网页数据读取结果（文字 + 表格 + 图表数据）
+        # ============================================================
+        _web_summary = data.get("web_page_summary", "")
+        if _web_summary:
+            with st.expander("🌐 网页数据读取结果（正文 / 表格 / 内嵌图表数据）", expanded=False):
+                st.caption("系统已自动读取相关新闻网页，提取文字、表格与内嵌图表数据供研报引用（图片 alt 亦被解析）。")
+                st.text_area("网页数据摘录", _web_summary[:4000], height=220, key="web_page_summary_area", disabled=True)
 
         # B. 研报正文展示
         # A+. 使用数据看板（产品运营视角：数据驱动）
@@ -1953,6 +2336,7 @@ with col_main:
                 hoverlabel=dict(font=dict(size=11, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
             )
             st.plotly_chart(fig_risk_radar, use_container_width=True, key="risk_radar_chart_bottom")
+            st.caption("📚 数据来源：真实财务指标映射（权益乘数/现金流质量/毛利率/ROE/行业政策基准，报告期见数据截止标注）")
 
             _risk_pdf = chart_pdf_bytes(fig_risk_radar)
             if _risk_pdf is not None:
@@ -2021,23 +2405,65 @@ with col_main:
                         "title": "杜邦因子对标（公司 vs 行业）",
                         "caption": f"数据口径：ROE/净利润率/资产周转率/权益乘数，公司值与行业聚合值（报告期 {data.get('market_as_of','—')}）",
                         "png": _png,
+                        "source": f"公司财务指标（{data.get('company_name','')}）vs 东方财富业绩报表行业聚合（{data.get('market_as_of','—')}）",
+                        "notes": [
+                            f"公司 ROE {data.get('company_roe','—')}% vs 行业 {data.get('industry_roe','—')}%",
+                            f"公司净利率 {data.get('company_margin','—')}% vs 行业 {data.get('industry_margin','—')}%",
+                            "杜邦三要素：利润率 / 资产周转率 / 权益乘数，驱动 ROE 差距归因见下页瀑布图",
+                        ],
                     }
                     _png = rex.render_chart_png("company_radar", data, title="标的公司与行业能力多维透视")
-                    _ci["radar"] = {"title": "能力多维透视雷达", "caption": "ROE/净利润率/资产周转率/财务杠杆/经营现金流（真实指标）", "png": _png}
+                    _ci["radar"] = {"title": "能力多维透视雷达", "caption": "ROE/净利润率/资产周转率/财务杠杆/经营现金流（真实指标）", "png": _png,
+                                    "source": f"公司财务指标 vs 行业聚合（{data.get('market_as_of','—')}）",
+                                    "notes": ["五项能力维度公司 vs 行业均值对比", "现金流维度单位：万元（公司）vs 行业每股现金流"]}
+                    _png = rex.render_chart_png("dupont_waterfall", data, title="杜邦 ROE 差距归因")
+                    _ci["waterfall"] = {"title": "杜邦 ROE 差距归因瀑布", "caption": "公司相对行业 ROE 差距的利润率/周转率/杠杆贡献分解",
+                                        "png": _png, "source": "对数分解示意（ln 差线性化），基数来自公司/行业真实财务指标",
+                                        "notes": ["柱状从行业 ROE 起步，逐项叠加三要素贡献得到公司 ROE", "绿色=正向贡献，红色=负向贡献"]}
                 else:
                     _png = rex.render_chart_png("market_share", data.get("market_share", {}), title="行业市场集中度（CR4）")
-                    _ci["share"] = {"title": "行业竞争格局", "caption": f"CR4={data.get('market_share',{}).get('values',[0])[0]}%（东方财富业绩报表真实聚合）", "png": _png}
+                    _ci["share"] = {"title": "行业竞争格局", "caption": f"CR4={data.get('market_share',{}).get('values',[0])[0]}%（东方财富业绩报表真实聚合）", "png": _png,
+                                    "source": f"东方财富业绩报表全市场聚合（报告期 {data.get('market_as_of','—')}）",
+                                    "notes": [f"行业 CR4 = {data.get('market_share',{}).get('values',[0])}%", "头部集中度反映竞争格局与定价权"]}
                     _png = rex.render_chart_png("market_growth", data.get("market_growth", {}), title="行业市场规模与复合增速")
-                    _ci["growth"] = {"title": "市场规模与增速", "caption": "市场规模/增速为估算口径；趋势示意，详见缺口说明", "png": _png}
+                    _ci["growth"] = {"title": "市场规模与增速", "caption": "市场规模/增速为估算口径；趋势示意，详见缺口说明", "png": _png,
+                                     "source": "市场规模/增速为公开区间估算；CR4/ROE 等为真实聚合",
+                                     "notes": ["柱状=市场规模（亿元），折线=同比增速（%）", "增速逐年放缓属行业成熟期典型特征"]}
                     _png = rex.render_chart_png("financial_trend", data.get("financial_trend", {}), title="主要盈利指标变化趋势")
-                    _ci["trend"] = {"title": "盈利指标趋势", "caption": "最新期为真实聚合值，历史期为趋势示意", "png": _png}
+                    _ci["trend"] = {"title": "盈利指标趋势", "caption": "最新期为真实聚合值，历史期为趋势示意", "png": _png,
+                                    "source": f"最新期=东方财富业绩报表（{data.get('market_as_of','—')}）；历史期=趋势示意",
+                                    "notes": ["ROE 与净利率双线走势", "用于判断行业盈利质量所处周期位置"]}
                     _png = rex.render_chart_png("capability_compare", data.get("capability_comparison", {}), title="企业多维核心财务能力对比")
-                    _ci["cap"] = {"title": "核心财务能力对比", "caption": "ROE/毛利率/CR4/净利率（真实聚合）", "png": _png}
+                    _ci["cap"] = {"title": "核心财务能力对比", "caption": "ROE/毛利率/CR4/净利率（真实聚合）", "png": _png,
+                                  "source": f"东方财富业绩报表聚合（{data.get('market_as_of','—')}）",
+                                  "notes": ["横向条形展示行业核心财务能力", "盈利能力（ROE）与集中度（CR4）为主要观察维度"]}
                 # 产业链 + 风险雷达
                 _png = rex.render_chart_png("industry_chain", data.get("industry_chain", {}), title="产业链全景逻辑流")
-                _ci["chain"] = {"title": "产业链全景逻辑流", "caption": "环节→龙头→利润率（区间值·综合公开资料）", "png": _png}
+                _ci["chain"] = {"title": "产业链全景逻辑流", "caption": "环节→龙头→利润率（区间值·综合公开资料）", "png": _png,
+                                "source": "行业公开研究/公司年报/实时新闻检索（区间值）",
+                                "notes": ["五环节：上游→中游→整机→下游→服务", "悬停可查看业务/龙头/成本/利润率/实时动态"]}
                 _png = rex.render_chart_png("risk_radar", data.get("risk_radar", {}), title="企业经营及财务多维风险指数")
-                _ci["risk"] = {"title": "多维风险指数雷达", "caption": "0=安全，5=高危；口径见风险板块说明", "png": _png}
+                _ci["risk"] = {"title": "多维风险指数雷达", "caption": "0=安全，5=高危；口径见风险板块说明", "png": _png,
+                               "source": "真实财务指标映射（权益乘数/现金流质量/毛利率/ROE/政策基准）",
+                               "notes": ["五维风险：杠杆/流动性/减值/盈利/政策", "数值越高风险越大"]}
+                # 龙头对比 + 新闻来源（需求 5/7）
+                _leader_x = data.get("leader_data", {}) or {}
+                if _leader_x.get("ok"):
+                    _png = rex.render_chart_png("leader_compare", _leader_x, title="龙头公司横向对比")
+                    _ci["leader"] = {"title": "龙头公司横向对比", "caption": f"{_leader_x.get('industry','')} · 3~4 家龙头多指标对比",
+                                     "png": _png,
+                                     "source": "东方财富财务摘要接口 / 上市公司公开报告兜底口径",
+                                     "notes": [f"{c}：{_leader_x.get('notes',{}).get(c,'')}" for c in _leader_x.get("companies", [])[:4]]}
+                _news_x = data.get("news_items", []) or []
+                if _news_x:
+                    _src_count = {}
+                    for _n in _news_x:
+                        _s = _n.get("source", "其他")
+                        _src_count[_s] = _src_count.get(_s, 0) + 1
+                    _png = rex.render_chart_png("news_source", {"sources": _src_count}, title="新闻/公告来源分布")
+                    _ci["news"] = {"title": "新闻/公告来源分布", "caption": "实时抓取来源占比（东方财富/搜狗/财新等）",
+                                   "png": _png, "source": "东方财富公告大全 / 7×24快讯 / 搜狗新闻 / 财新网",
+                                   "notes": [f"共 {len(_news_x)} 条实时信息", "来源链接见报告正文新闻板块"]}
                 _gap_texts = ["• " + g["item"] + f"（{g['status']}）" + (f"：{g['reason']}" if g.get("reason") else "")
                               for g in data.get("data_gaps", [])]
                 _meta = data.get("report_meta", {})
@@ -2050,6 +2476,8 @@ with col_main:
                     st.session_state['current_query'],
                     st.session_state['current_report'],
                     _ci, evidence_data, _gap_texts, _meta, is_company_mode,
+                    leader_data=data.get("leader_data", {}),
+                    news_items=data.get("news_items", []),
                 )
                 st.session_state["export_cache"] = {"docx": _doc_bytes, "pptx": _ppt_bytes}
             except Exception as _exp_err:
