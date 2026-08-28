@@ -40,8 +40,54 @@ def init_learning_schema():
             created_at TEXT DEFAULT ''
         )"""
     )
+    # 系统调用记录字段（证明知识库被 AI 投研系统学习调用）
+    for col, ddl in [
+        ("used_count", "INTEGER DEFAULT 0"),
+        ("last_used", "TEXT DEFAULT ''"),
+        ("last_used_by", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE learning_resources ADD COLUMN {col} {ddl}")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
+
+
+def mark_used(titles, agent="Report Agent"):
+    """记录某份资料被某个 Agent 调用（用于展示系统学习使用情况）。"""
+    if not titles:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for t in titles:
+        if not t:
+            continue
+        cur.execute(
+            "UPDATE learning_resources SET used_count = COALESCE(used_count,0)+1, last_used=?, last_used_by=? WHERE title=?",
+            (now, agent, t),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_usage_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        total = cur.execute("SELECT COUNT(*) FROM learning_resources").fetchone()[0]
+        used = cur.execute("SELECT COUNT(*) FROM learning_resources WHERE COALESCE(used_count,0)>0").fetchone()[0]
+        calls = cur.execute("SELECT COALESCE(SUM(used_count),0) FROM learning_resources").fetchone()[0]
+        recent = cur.execute(
+            "SELECT title, used_count, last_used_by, last_used FROM learning_resources "
+            "WHERE COALESCE(used_count,0)>0 ORDER BY last_used DESC LIMIT 8"
+        ).fetchall()
+    except Exception:
+        total = used = calls = 0
+        recent = []
+    conn.close()
+    return {"total": total, "used": used, "calls": calls, "recent": recent}
 
 
 def _norm_tags(tags):
