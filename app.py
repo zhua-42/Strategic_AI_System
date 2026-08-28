@@ -321,8 +321,19 @@ def auto_align_industry(company_name="", query_industry=""):
 # ============================
 # 🌟 Vector Database & RAG 自动同步 🌟
 # ============================
-# 本地模型目录（优先加载，完全离线可用）
-LOCAL_MODEL_DIR = os.path.join("models", "paraphrase-multilingual-MiniLM-L12-v2")
+# 本地模型目录候选（优先加载，完全离线可用；兼容新旧模型）
+LOCAL_MODEL_DIRS = [
+    os.path.join("models", "bge-small-zh-v1.5"),                    # 推荐：95MB，中文效果好
+    os.path.join("models", "paraphrase-multilingual-MiniLM-L12-v2"),  # 旧：470MB
+]
+# 云端下载候选（体积从小到大，保证最快可用）
+DOWNLOAD_MODEL_CANDIDATES = [
+    "BAAI/bge-small-zh-v1.5",
+    "paraphrase-multilingual-MiniLM-L12-v2",
+]
+
+# 手动缓存成功结果：失败不缓存（None），下次启动自动重试
+_EMBEDDING_CACHE = {"model": None}
 
 
 def _source_reachable(url, timeout=5):
@@ -357,32 +368,44 @@ def _run_with_timeout(fn, seconds):
     return box.get("value")
 
 
-@st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    """加载向量模型：优先本地 models/ 目录（离线），其次国内镜像，最后官方源；全部失败返回 None（降级为关键词检索）。"""
+    """加载向量模型：本地 models/ 目录（离线）→ 云端下载（小模型优先）。
+    成功结果缓存；失败不缓存，下次自动重试。"""
     # 1) 本地模型目录（最优先，无需联网）
-    if os.path.isdir(LOCAL_MODEL_DIR):
-        try:
-            return SentenceTransformer(LOCAL_MODEL_DIR)
-        except Exception:
-            pass
-    # 2) 国内镜像 -> 官方源（先探测可达性，不通立即跳过；下载有超时保护）
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "8")
-    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "8")
+    for local_dir in LOCAL_MODEL_DIRS:
+        if os.path.isdir(local_dir):
+            try:
+                model = SentenceTransformer(local_dir)
+                _EMBEDDING_CACHE["model"] = model
+                print(f"[RAG] 已从本地加载向量模型: {local_dir}")
+                return model
+            except Exception:
+                continue
+    # 2) 已成功缓存的模型
+    if _EMBEDDING_CACHE.get("model") is not None:
+        return _EMBEDDING_CACHE["model"]
+    # 3) 云端下载（小模型优先；放宽超时保证 95MB 模型可下载完成）
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
     # 本地环境（fix_and_run.ps1 设置了 SAS_FAST_START）给 20 秒快速失败；
-    # 云端部署给 120 秒，保证首次能下载完约 470MB 的模型。
-    per_source_timeout = 20 if os.environ.get("SAS_FAST_START") == "1" else 120
-    for endpoint in ["https://hf-mirror.com", "https://huggingface.co"]:
-        if not _source_reachable(endpoint):
-            continue
-        os.environ["HF_ENDPOINT"] = endpoint
-        model = _run_with_timeout(
-            lambda: SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
-            seconds=per_source_timeout,
-        )
-        if model is not None:
-            return model
-    print("[RAG] 向量模型加载失败（网络受限），已降级为关键词检索。可将模型放入 models/paraphrase-multilingual-MiniLM-L12-v2 后重启启用向量检索。")
+    # 云端部署给 300 秒，保证 95MB 小模型（或 470MB 旧模型）能下载完成。
+    per_source_timeout = 20 if os.environ.get("SAS_FAST_START") == "1" else 300
+    for model_name in DOWNLOAD_MODEL_CANDIDATES:
+        for endpoint in ["https://hf-mirror.com", "https://huggingface.co"]:
+            if not _source_reachable(endpoint):
+                continue
+            os.environ["HF_ENDPOINT"] = endpoint
+            # 用默认参数绑定，避免 lambda 闭包捕获循环变量
+            model = _run_with_timeout(
+                lambda mn=model_name: SentenceTransformer(mn),
+                seconds=per_source_timeout,
+            )
+            if model is not None:
+                _EMBEDDING_CACHE["model"] = model
+                print(f"[RAG] 已从 {endpoint} 下载向量模型: {model_name}")
+                return model
+    print("[RAG] 向量模型下载失败（网络受限），已降级为关键词检索。"
+          "云端首次加载会自动重试；也可将模型放入 models/bge-small-zh-v1.5 目录实现离线加载。")
     return None
 
 
@@ -391,10 +414,10 @@ def get_vector_db_and_model():
     初始化向量库 + 语义模型。
     任何一步失败（模型下载受限 / chromadb Rust 绑定环境问题 / 索引异常）
     都自动降级为「关键词检索」模式，绝不让 RAG 拖垮整个网站。
+    注意：本函数可能在后台线程执行，不能使用 st.spinner 等 UI 操作。
     """
     try:
-        with st.spinner("正在准备 AI 检索能力，请稍候（若网络受限会自动切换为快速模式）..."):
-            model = load_embedding_model()
+        model = load_embedding_model()
         if model is None:
             return None, None
         # 确保向量库目录存在（云端从仓库克隆后可能没有该目录）
@@ -450,16 +473,94 @@ def get_vector_db_and_model():
             pass
         return None, None
 
-# 模块加载时初始化；失败也绝不阻断网站启动
-try:
-    embedding_model, collection = get_vector_db_and_model()
-except Exception:
-    embedding_model, collection = None, None
 
+# ============================================================
+# RAG 异步就绪机制（云端友好）
+# ------------------------------------------------------------
+# 模块加载时：
+#   1) 本地有模型 -> 同步初始化，立即启用语义检索；
+#   2) 本地无模型 -> 网站立即打开，后台线程下载小模型（95MB），
+#      完成后自动切换到语义检索（vector_search 每次检查 _RAG_STATE）。
+# 这样云端首次访问不会被模型下载阻塞 300 秒，也不会永久降级。
+# ============================================================
+_RAG_STATE = {"model": None, "collection": None, "status": "init", "note": ""}
+
+
+def _try_local_rag():
+    """尝试用本地模型同步初始化 RAG（快，不下载）。成功返回 (model, coll)。"""
+    for local_dir in LOCAL_MODEL_DIRS:
+        if os.path.isdir(local_dir):
+            try:
+                model = SentenceTransformer(local_dir)
+                _EMBEDDING_CACHE["model"] = model
+                # 同步初始化 chromadb collection（本地环境 chromadb 正常可用）
+                os.makedirs("vector_db", exist_ok=True)
+                v_client = chromadb.PersistentClient(path="./vector_db")
+                coll = v_client.get_or_create_collection(name="financial_knowledge")
+                _RAG_STATE["model"] = model
+                _RAG_STATE["collection"] = coll
+                _RAG_STATE["status"] = "ready"
+                _RAG_STATE["note"] = f"本地模型 {local_dir}"
+                print(f"[RAG] 已从本地加载向量模型: {local_dir}")
+                return model, coll
+            except Exception as e:
+                print(f"[RAG] 本地模型加载失败 {local_dir}: {e}")
+                continue
+    return None, None
+
+
+def _bg_rag_init():
+    """后台线程：下载小模型 + 初始化 chromadb + 索引知识库。"""
+    try:
+        model, coll = get_vector_db_and_model()
+        if model is not None:
+            _RAG_STATE["model"] = model
+            _RAG_STATE["collection"] = coll
+            _RAG_STATE["status"] = "ready"
+            _RAG_STATE["note"] = "语义检索已就绪（后台下载完成）"
+            print("[RAG] 后台初始化完成，已切换为语义检索。")
+        else:
+            _RAG_STATE["status"] = "fallback"
+            _RAG_STATE["note"] = "语义模型下载失败，使用关键词检索（下次启动自动重试）"
+    except Exception as e:
+        _RAG_STATE["status"] = "fallback"
+        _RAG_STATE["note"] = f"RAG 初始化异常：{str(e)[:100]}"
+
+
+def _sync_rag_state():
+    """把后台初始化结果同步到模块级 embedding_model/collection。"""
+    global embedding_model, collection
+    if _RAG_STATE["status"] == "ready" and _RAG_STATE["model"] is not None:
+        embedding_model = _RAG_STATE["model"]
+        collection = _RAG_STATE["collection"]
+
+
+# 模块加载：本地模型同步初始化；否则立即降级并启动后台下载
+embedding_model, collection = _try_local_rag()
 if embedding_model is None:
-    st.sidebar.info("当前为“关键词检索”模式：语义模型/向量库未就绪（云端环境限制时自动降级），网页功能不受影响。")
+    embedding_model, collection = None, None
+    _RAG_STATE["status"] = "downloading"
+    _RAG_STATE["note"] = "语义模型下载中（首次约 1~2 分钟），当前使用关键词检索"
+    try:
+        import threading
+        threading.Thread(target=_bg_rag_init, daemon=True).start()
+    except Exception:
+        _RAG_STATE["status"] = "fallback"
+
+# 侧边栏状态提示（每次 rerun 同步状态）
+_sync_rag_state()
+if embedding_model is None:
+    if _RAG_STATE["status"] == "downloading":
+        st.sidebar.info("🔍 语义检索模型下载中（首次约 1~2 分钟），当前为关键词检索；下载完成后自动升级。")
+    else:
+        st.sidebar.info("当前为“关键词检索”模式：语义模型未就绪（云端网络受限时自动降级），网页功能不受影响。")
+else:
+    st.sidebar.success(f"✅ 语义检索已就绪（{_RAG_STATE.get('note', '')}）")
+
 
 def vector_search(query_text, top_k=3):
+    # 每次查询前同步后台初始化结果（后台下载完成后自动启用语义检索）
+    _sync_rag_state()
     # 向量库不可用（如模型未下载成功）时，降级为关键词检索
     if embedding_model is None or collection is None:
         return get_rag_context(query_text, top_k=top_k)
