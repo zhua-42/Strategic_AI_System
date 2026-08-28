@@ -14,6 +14,34 @@ from docx.shared import Inches  # 用于Word文档中精细调整图表大小
 import akshare as ak
 import pdfplumber  # 导入推荐技术栈中的 PDF 处理库
 import pandas as pd
+
+# ============================================================
+# chromadb 兼容层（云端环境修复）
+# ------------------------------------------------------------
+# Streamlit Cloud 的 Python 3.12 可能自带旧版 sqlite3（<3.35），
+# chromadb 导入时会直接抛 RuntimeError；若环境装有 pysqlite3-binary
+# （新版 sqlite），则用它替换标准 sqlite3 模块，保证 chromadb 可用。
+# 即使这一步失败也不影响网站——RAG 会在下方 get_vector_db_and_model()
+# 中整体容错，自动降级为关键词检索。
+# ============================================================
+def _ensure_chromadb_sqlite():
+    try:
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            return
+    except Exception:
+        pass
+    try:
+        import pysqlite3  # noqa: F401
+        import sys
+        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+        sys.modules.pop("__pysqlite3__", None)
+        print("[chromadb] 已用 pysqlite3-binary 替换 sqlite3 模块（>=3.35）。")
+    except Exception:
+        print("[chromadb] 提示：系统 sqlite3 版本过低，且未安装 pysqlite3-binary；"
+              "RAG 将自动降级为关键词检索，网站功能不受影响。")
+
+
+_ensure_chromadb_sqlite()
 import chromadb
 from sentence_transformers import SentenceTransformer
 import product_features as pf
@@ -359,55 +387,77 @@ def load_embedding_model():
 
 
 def get_vector_db_and_model():
-    with st.spinner("正在准备 AI 检索能力，请稍候（若网络受限会自动切换为快速模式）..."):
-        model = load_embedding_model()
-    if model is None:
-        return None, None
-    v_client = chromadb.PersistentClient(path="./vector_db")
-    coll = v_client.get_or_create_collection(name="financial_knowledge")
-    
-    knowledge_dir = "knowledge"
-    if os.path.exists(knowledge_dir):
-        # 已索引文件名集合（增量索引：新学习资料自动入向量库）
-        indexed = set()
-        try:
-            _existing = coll.get(include=["metadatas"])
-            for _m in (_existing.get("metadatas") or []):
-                indexed.add(_m.get("source", ""))
-        except Exception:
-            _existing = {}
-        for root, dirs, files in os.walk(knowledge_dir):
-            for filename in files:
-                if filename.endswith((".xlsx", ".xls", ".csv", ".db")):
-                    continue
-                if filename in indexed:
-                    continue
-                filepath = os.path.join(root, filename)
-                text_content = ""
-                try:
-                    if filename.endswith(".pdf"):
-                        with pdfplumber.open(filepath) as pdf:
-                            for page in pdf.pages:
-                                text_content += page.extract_text() or ""
-                    elif filename.endswith((".txt", ".md")):
-                        with open(filepath, "r", encoding="utf-8") as f:
-                            text_content = f.read()
-                    
-                    if text_content:
-                        chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
-                        if chunks:
-                            embeddings = model.encode(chunks).tolist()
-                            ids = [f"{filename}_{idx}" for idx in range(len(chunks))]
-                            metadatas = [{"source": filename} for _ in chunks]
-                            coll.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
-                except Exception as e:
-                    print(f"RAG 自动索引失败 {filename}: {e}")
-    return model, coll
+    """
+    初始化向量库 + 语义模型。
+    任何一步失败（模型下载受限 / chromadb Rust 绑定环境问题 / 索引异常）
+    都自动降级为「关键词检索」模式，绝不让 RAG 拖垮整个网站。
+    """
+    try:
+        with st.spinner("正在准备 AI 检索能力，请稍候（若网络受限会自动切换为快速模式）..."):
+            model = load_embedding_model()
+        if model is None:
+            return None, None
+        # 确保向量库目录存在（云端从仓库克隆后可能没有该目录）
+        os.makedirs("vector_db", exist_ok=True)
+        v_client = chromadb.PersistentClient(path="./vector_db")
+        coll = v_client.get_or_create_collection(name="financial_knowledge")
 
-embedding_model, collection = get_vector_db_and_model()
+        knowledge_dir = "knowledge"
+        if os.path.exists(knowledge_dir):
+            # 已索引文件名集合（增量索引：新学习资料自动入向量库）
+            indexed = set()
+            try:
+                _existing = coll.get(include=["metadatas"])
+                for _m in (_existing.get("metadatas") or []):
+                    indexed.add(_m.get("source", ""))
+            except Exception:
+                _existing = {}
+            for root, dirs, files in os.walk(knowledge_dir):
+                for filename in files:
+                    if filename.endswith((".xlsx", ".xls", ".csv", ".db")):
+                        continue
+                    if filename in indexed:
+                        continue
+                    filepath = os.path.join(root, filename)
+                    text_content = ""
+                    try:
+                        if filename.endswith(".pdf"):
+                            with pdfplumber.open(filepath) as pdf:
+                                for page in pdf.pages:
+                                    text_content += page.extract_text() or ""
+                        elif filename.endswith((".txt", ".md")):
+                            with open(filepath, "r", encoding="utf-8") as f:
+                                text_content = f.read()
+
+                        if text_content:
+                            chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
+                            if chunks:
+                                embeddings = model.encode(chunks).tolist()
+                                ids = [f"{filename}_{idx}" for idx in range(len(chunks))]
+                                metadatas = [{"source": filename} for _ in chunks]
+                                coll.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
+                    except Exception as e:
+                        print(f"RAG 自动索引失败 {filename}: {e}")
+        return model, coll
+    except Exception as e:
+        # chromadb 在部分云端环境初始化失败（Rust 绑定/线程清理问题），
+        # 降级为关键词检索，保证网站照常可用。
+        print(f"[RAG] 向量库初始化失败，已降级为关键词检索模式: {type(e).__name__}: {e}")
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        return None, None
+
+# 模块加载时初始化；失败也绝不阻断网站启动
+try:
+    embedding_model, collection = get_vector_db_and_model()
+except Exception:
+    embedding_model, collection = None, None
 
 if embedding_model is None:
-    st.sidebar.info("当前为“关键词检索”模式：AI 语义模型未加载成功，网页功能不受影响。将模型文件放入 models/ 文件夹后重启，即可升级为更智能的语义检索。")
+    st.sidebar.info("当前为“关键词检索”模式：语义模型/向量库未就绪（云端环境限制时自动降级），网页功能不受影响。")
 
 def vector_search(query_text, top_k=3):
     # 向量库不可用（如模型未下载成功）时，降级为关键词检索
