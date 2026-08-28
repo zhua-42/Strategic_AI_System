@@ -11,8 +11,13 @@ kaleido==0.2.1
 akshare>=1.18.0
 pandas>=2.0.0
 pdfplumber
-chromadb>=0.5.0
+# chromadb 固定到 0.5.x 稳定线：1.x 引入 Rust 绑定，在部分云端环境（如 Streamlit Cloud）
+# 初始化失败（AttributeError: del self.bindings，见 chroma-core/chroma#5868）。
+# 0.5.x 无 Rust 绑定，API（PersistentClient/get_or_create_collection/add/query）完全兼容。
+chromadb==0.5.23
 sentence-transformers>=2.7.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 Pillow>=10.0.0
+# 保险：若云端系统 sqlite3 < 3.35（chromadb 要求 >=3.35），用 pysqlite3-binary 兜底
+pysqlite3-binary; platform_system == "Linux"
