@@ -13,3 +13,6 @@ pandas>=2.0.0
 pdfplumber
 chromadb>=0.5.0
 sentence-transformers>=2.7.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+Pillow>=10.0.0
