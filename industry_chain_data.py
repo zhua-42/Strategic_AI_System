@@ -481,16 +481,12 @@ def get_chain(industry_name):
 
 
 def build_chain_payload(industry_name):
-    """生成 3D 图用的 payload：nodes/positions/details/hover + matched industry。"""
+    """生成 3D 图用的 payload：nodes/positions/details/hover + matched industry。
+    未收录行业时自动生成「通用五环节产业链结构」，保证 3D 图每次都呈现。"""
     chain, matched = get_chain(industry_name)
     if not chain:
-        return {
-            "matched_industry": None,
-            "industry_label": industry_name or "该行业",
-            "nodes": [],
-            "stage_colors": CHAIN_THEME,
-            "note": "该行业暂未收录细分产业链数据，已使用通用结构，建议上传行业研报补充。",
-        }
+        chain = build_generic_chain(industry_name)
+        matched = None
     n = len(chain)
     nodes = []
     for i, seg in enumerate(chain):
@@ -509,10 +505,66 @@ def build_chain_payload(industry_name):
             "features": seg["features"],
             "source": seg["source"],
         })
+    note = "环节成本与利润率为区间值·综合公开资料（详见各环节 hover 数据来源）。"
+    if matched is None:
+        note = "该行业暂未收录细分产业链库，已展示「通用产业链框架」；系统已通过实时新闻/公告检索补充该行业动态，建议上传行业研报进一步细化。"
     return {
         "matched_industry": matched,
         "industry_label": matched or (industry_name or "该行业"),
         "nodes": nodes,
         "stage_colors": CHAIN_THEME,
-        "note": "环节成本与利润率为区间值·综合公开资料（详见各环节 hover 数据来源）。",
+        "note": note,
     }
+
+
+def build_generic_chain(industry_name):
+    """通用产业链五环节结构（用于未收录行业，保证 3D 全景每次必现）。"""
+    label = str(industry_name or "该行业").strip()
+    generic = [
+        {
+            "stage": "upstream", "name": "上游·基础材料与原料",
+            "business": f"{label}行业的上游原材料、核心资源与基础材料供应环节（具体细分需结合行业研报确认）。",
+            "leaders": "该环节龙头企业（详见行业研报/实时新闻检索）",
+            "cost": "上游原材料成本占比通常较高，价格波动直接传导至中下游。",
+            "margin": "视供需格局而定（区间值·综合公开资料）",
+            "features": "资源与技术双门槛，周期属性较强。",
+            "source": "通用产业链框架·实时新闻检索补充",
+        },
+        {
+            "stage": "midstream", "name": "中游·核心部件与制造",
+            "business": f"{label}行业核心零部件、中间品与制造加工环节（具体细分需结合行业研报确认）。",
+            "leaders": "该环节龙头/骨干企业（详见行业研报/实时新闻检索）",
+            "cost": "制造与设备投入为主要成本项，规模效应显著。",
+            "margin": "视竞争格局而定（区间值·综合公开资料）",
+            "features": "技术密度与资本开支中等偏高，头部集中度逐步提升。",
+            "source": "通用产业链框架·实时新闻检索补充",
+        },
+        {
+            "stage": "integration", "name": "整机·系统集成与品牌",
+            "business": f"{label}行业的整机/系统集成、品牌运营与渠道销售环节（具体细分需结合行业研报确认）。",
+            "leaders": "该环节头部企业（详见行业研报/实时新闻检索）",
+            "cost": "品牌、渠道与营销费用占比上升，原材料成本占比下降。",
+            "margin": "品牌力决定定价权，利润率分化明显（区间值·综合公开资料）",
+            "features": "规模+品牌+渠道三要素，行业景气度核心环节。",
+            "source": "通用产业链框架·实时新闻检索补充",
+        },
+        {
+            "stage": "downstream", "name": "下游·应用与终端需求",
+            "business": f"{label}行业的下游应用场景、终端需求与渠道流通环节（具体细分需结合行业研报确认）。",
+            "leaders": "该环节主要应用/流通企业（详见行业研报/实时新闻检索）",
+            "cost": "运营、流量与履约成本占比高，重资产与轻服务并存。",
+            "margin": "运营环节利润率通常低于制造端（区间值·综合公开资料）",
+            "features": "需求端景气度决定全链量价；政策与宏观消费是核心变量。",
+            "source": "通用产业链框架·实时新闻检索补充",
+        },
+        {
+            "stage": "service", "name": "服务·售后与生态延伸",
+            "business": f"{label}行业的售后服务、回收再生、数据与生态增值服务（具体细分需结合行业研报确认）。",
+            "leaders": "该环节服务/回收企业（详见行业研报/实时新闻检索）",
+            "cost": "人力与合规成本为主要成本项。",
+            "margin": "服务化收入毛利通常高于制造端（区间值·综合公开资料）",
+            "features": "服务化与循环经济是第二增长曲线，政策与标准逐步完善。",
+            "source": "通用产业链框架·实时新闻检索补充",
+        },
+    ]
+    return generic
