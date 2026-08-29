@@ -859,6 +859,115 @@ def get_judge_reference(industry):
         "risk": risk if risk else "暂无风险数据"
     }
 
+
+# ============================================================
+# 🔗 资料缺口自动补链（缺口 → 分析需要什么 → 搜索可获取链接）
+# ============================================================
+# 官方固定入口（100% 可用，无需搜索）：按缺口类型给出权威获取地址
+OFFICIAL_SOURCE_LINKS = {
+    "年报": [
+        ("巨潮资讯网（法定披露平台·年报/公告 PDF 下载）", "http://www.cninfo.com.cn/new/index"),
+        ("上交所官网（沪市公司定期报告）", "http://www.sse.com.cn/assortment/stock/list/info/announcement/"),
+        ("深交所官网（深市公司定期报告）", "http://www.szse.cn/disclosure/listed/bulletinDetail/index.html"),
+    ],
+    "财务": [
+        ("巨潮资讯网（年报/半年报/财务数据）", "http://www.cninfo.com.cn/new/index"),
+        ("东方财富数据中心（业绩报表）", "https://data.eastmoney.com/bbsj/"),
+        ("新浪财经（公司财务摘要）", "https://finance.sina.com.cn/stock/"),
+    ],
+    "行业": [
+        ("东方财富行业研报中心", "https://data.eastmoney.com/report/industry.jshtml"),
+        ("慧博投研资讯（行业研报）", "https://www.hibor.com.cn/"),
+        ("发现报告（行业研究报告）", "https://www.fxbaogao.com/"),
+    ],
+    "政策": [
+        ("中国政府网（政策文件库）", "https://www.gov.cn/zhengce/"),
+        ("工信部官网（产业政策）", "https://www.miit.gov.cn/"),
+        ("国家发改委（产业政策与规划）", "https://www.ndrc.gov.cn/"),
+    ],
+    "新闻": [
+        ("东方财富资讯", "https://finance.eastmoney.com/"),
+        ("财新网", "https://www.caixin.com/"),
+        ("新浪财经新闻", "https://finance.sina.com.cn/"),
+    ],
+    "研报": [
+        ("东方财富研报中心", "https://data.eastmoney.com/report/"),
+        ("慧博投研资讯", "https://www.hibor.com.cn/"),
+        ("发现报告", "https://www.fxbaogao.com/"),
+    ],
+    "风险": [
+        ("证监会（监管与风险提示）", "http://www.csrc.gov.cn/"),
+        ("巨潮资讯（公司公告含风险提示）", "http://www.cninfo.com.cn/new/index"),
+    ],
+}
+
+# 缺口类型 → 关键词模板（用于自动搜索）
+_GAP_KEYWORD_TMPL = {
+    "年报": "{kw} {year}年年度报告 PDF 下载 巨潮资讯",
+    "财务": "{kw} 财务报表 财务指标 下载",
+    "行业": "{kw} 行业研究报告 PDF 下载",
+    "政策": "{kw} 政策 文件 原文 官网",
+    "新闻": "{kw} 最新新闻 公告",
+    "研报": "{kw} 深度研究报告 PDF",
+    "风险": "{kw} 风险提示 公告",
+}
+
+
+def _gap_type_of(item_text):
+    """根据缺口项文本判断资料类型，返回 (type, 搜索词)。"""
+    t = str(item_text or "")
+    if "年报" in t or "财务指标" in t or "财报" in t:
+        return "年报", t.replace(" 财务指标（ROE/利润率/周转/乘数）", "").replace(" 财务指标", "")
+    if "可比公司" in t or "同行业" in t:
+        return "行业", t.replace(" 数据", "").replace("（可选：上传可比公司对照表以获得更强基准）", "")
+    if "行业基准" in t or "市场规模" in t or "行业研报" in t:
+        return "行业", t.replace(" 行业基准数据", "").replace(" 行业基准", "")
+    if "政策" in t:
+        return "政策", t.replace(" 数据", "")
+    if "新闻" in t or "公告" in t:
+        return "新闻", t.replace(" 数据", "")
+    if "风险" in t:
+        return "风险", t
+    return "研报", t
+
+
+def suggest_gap_sources(gap_item, company_name="", industry="", year="2025"):
+    """
+    为单个资料缺口自动生成「获取资料链接」：
+    1) 官方固定入口（巨潮/交易所/政府网等，按资料类型）
+    2) 自动搜索（搜狗网页搜索，按缺口类型生成关键词）
+    返回 {"official": [{"name","url"}], "search": [{"title","url","source"}], "note": str}
+    """
+    item_text = str(gap_item.get("item", ""))
+    gap_type, base_kw = _gap_type_of(item_text)
+    # 可比公司/行业类缺口优先用行业名搜索；其余优先公司名
+    if gap_type == "行业" and industry:
+        kw_entity = industry
+    elif gap_type == "行业" and not industry:
+        kw_entity = base_kw or company_name or item_text
+    else:
+        kw_entity = company_name or industry or base_kw or item_text
+
+    # 1) 官方固定入口
+    official = OFFICIAL_SOURCE_LINKS.get(gap_type, OFFICIAL_SOURCE_LINKS["研报"])
+
+    # 2) 自动搜索
+    tmpl = _GAP_KEYWORD_TMPL.get(gap_type, _GAP_KEYWORD_TMPL["研报"])
+    search_kw = tmpl.format(kw=kw_entity, year=year).strip()
+    if company_name and "年报" in tmpl:
+        search_kw = f"{company_name} {year}年年度报告 PDF 下载 巨潮资讯"
+    try:
+        _r = nf.search_web_pages(search_kw, limit=5)
+        search = _r.get("items", []) or []
+        note = _r.get("note", "")
+    except Exception as e:
+        search = []
+        note = f"自动搜索失败: {str(e)[:80]}"
+    if not search:
+        note = "自动搜索暂无结果（网络受限时请使用右侧官方入口）"
+    return {"official": official, "search": search, "note": note,
+            "search_kw": search_kw, "type": gap_type}
+
 # ============================================================
 # 🌟 真实风险雷达（基于真实财务指标映射，口径透明可溯）🌟
 # ============================================================
@@ -1937,15 +2046,42 @@ with col_main:
             _m1.metric("检查项", len(_gaps))
             _m2.metric("❌ 缺失（需补充）", len(_missing))
             _m3.metric("⚠️ 部分可替代", len(_partial))
+            _gap_note = st.session_state.get("gap_uploaded_note", "")
+            if _gap_note:
+                st.success(_gap_note)
             for g in _gaps:
                 _icon = {"ok": "✅", "partial": "⚠️", "missing": "❌"}.get(g.get("status"), "ℹ️")
                 st.markdown(f"**{_icon} {g.get('item','')}**　*状态：{g.get('status','')}*")
                 st.caption(f"为什么：{g.get('reason','')}")
                 if g.get("suggest"):
                     st.caption(f"如何补充：{g.get('suggest','')}")
-            _gap_note = st.session_state.get("gap_uploaded_note", "")
-            if _gap_note:
-                st.success(_gap_note)
+                # ============ 自动补链：系统自己分析需要什么资料并搜索获取链接 ============
+                if g.get("status") in ("missing", "partial"):
+                    _gap_key = f"gap_src_{g.get('item','')[:30]}_{hash(g.get('reason','')) & 0xffff}"
+                    with st.expander(f"🔗 自动获取资料链接（{g.get('item','')[:24]}）", expanded=False):
+                        _src_meta = suggest_gap_sources(g, company_name=st.session_state.get("precheck_company", ""),
+                                                        industry=st.session_state.get("precheck_industry", ""))
+                        st.caption(f"📋 系统分析：该项需要 **{_src_meta['type']}** 类资料，已按「{_src_meta['search_kw']}」检索")
+                        # 官方固定入口
+                        st.markdown("**🏛️ 官方权威入口（推荐，100% 可访问）**")
+                        for _name, _url in _src_meta["official"]:
+                            st.markdown(f"- [{_name}]({_url})")
+                        # 自动搜索结果
+                        st.markdown("**🔍 自动搜索到的资料页**")
+                        if _src_meta["search"]:
+                            for _it in _src_meta["search"][:4]:
+                                _t = _it.get("title", "")
+                                _u = _it.get("url", "")
+                                _s = _it.get("source", "")
+                                if _u and _u.startswith("http"):
+                                    st.markdown(f"- {_t}（{_s}）[打开]({_u})")
+                                elif _u:
+                                    st.markdown(f"- {_t}（{_s}）[搜狗跳转](https://www.sogou.com{_u if _u.startswith('/') else '/' + _u})")
+                                else:
+                                    st.markdown(f"- {_t}（{_s}）")
+                        else:
+                            st.caption(_src_meta["note"])
+                        st.caption("💡 下载后可在下方「上传缺失资料」直接上传，系统自动解析入库参与研究。")
             with st.expander("📤 上传缺失资料（系统将自动解析入库，研报会引用你的资料）", expanded=bool(_missing)):
                 _gap_files = st.file_uploader(
                     "支持多文件：年报/研报 PDF、财务数据表 XLSX/CSV、政策或新闻 TXT/MD",
