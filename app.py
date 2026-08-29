@@ -2347,19 +2347,37 @@ with col_main:
                             "📚 数据来源：%{customdata.source}<extra></extra>"
                         ),
                     )])
-                    _z_axis = dict(showticklabels=False)
+                    _z_axis = dict(showticklabels=True)
+                    # 三轴语义化：X=环节推进（上游→下游）、Y=阶段层级、Z=利润率中值(%)
+                    _x_ticks = [nd["x"] for nd in nodes]
+                    _x_labels = [str(nd["name"])[:8] for nd in nodes]
+                    _stage_ticks = [1.5, 0.75, 0.0, -0.75, -1.5]
+                    _stage_labels = ["上游", "中游", "整机/集成", "下游", "服务/回收"]
                     fig_3d.update_layout(
-                        height=460,
+                        height=500,
                         margin=dict(l=0, r=0, b=0, t=10),
                         scene=dict(
-                            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-                            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-                            zaxis=_z_axis,
+                            xaxis=dict(
+                                title=dict(text="环节推进（上游 → 下游）", font=dict(size=12, color="#1e3a8a")),
+                                tickmode="array", tickvals=_x_ticks, ticktext=_x_labels,
+                                tickfont=dict(size=9, color="#334155"), showgrid=True, zeroline=False,
+                            ),
+                            yaxis=dict(
+                                title=dict(text="产业链阶段层级", font=dict(size=12, color="#0d9488")),
+                                tickmode="array", tickvals=_stage_ticks, ticktext=_stage_labels,
+                                tickfont=dict(size=10, color="#334155"), showgrid=True, zeroline=True,
+                            ),
+                            zaxis=dict(
+                                title=dict(text="环节利润率中值 (%)", font=dict(size=12, color="#b45309")),
+                                tickfont=dict(size=10, color="#334155"), showgrid=True, zeroline=True,
+                            ),
                             camera=dict(eye=dict(x=1.4, y=1.2, z=0.9)),
                         ),
                         hoverlabel=dict(font=dict(size=12, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
                     )
                     st.plotly_chart(fig_3d, use_container_width=True, key="industry_3d_chain_chart")
+                    st.caption("📐 坐标含义：**X 轴**＝产业链环节推进（上游→下游）｜**Y 轴**＝阶段层级（上游1.5 → 服务-1.5）｜"
+                               "**Z 轴**＝环节利润率中值(%)（由各环节利润率区间解析，真实口径）")
                 except Exception as _3d_err:
                     # 3D 图渲染容错：极少数 plotly 版本兼容性问题时降级为列表展示，不阻断页面
                     print(f"[3D Chain] 3D 渲染失败，降级为列表展示: {_3d_err}")
