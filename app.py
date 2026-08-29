@@ -184,6 +184,12 @@ def init_database():
     conn.commit()
     conn.close()
 
+    # 确保学习资料库表结构完整（旧库可能缺 used_count 等列）
+    try:
+        ldata.init_learning_schema()
+    except Exception as _e:
+        print(f"⚠️ [Database] 学习资料库 schema 初始化失败: {_e}")
+
     # 尝试加载组员的 Excel 数据
     import_financial_excel()
 
