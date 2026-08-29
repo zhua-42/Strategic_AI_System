@@ -136,6 +136,139 @@ def _ak_import():
     return ak
 
 
+def fetch_industry_live(industry, force=False):
+    """
+    实时抓取指定行业的聚合基准（东方财富业绩报表 + 行业归一映射）。
+    供「资料缺口审查」使用：本地库没有该行业时，先尝试实时抓取，
+    抓取成功则写入 industry_benchmark 并返回数据；失败返回 None。
+    返回 dict 或 None。
+    """
+    try:
+        df, period = fetch_performance_report()
+        if df is None:
+            return None
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        # 找行业列与营收列
+        ind_col = next((c for c in df.columns if "所处行业" in c), None)
+        rev_col = next((c for c in df.columns if "营业总收入-营业总收入" in c
+                        or ("营业总收入" in c and "同比" not in c)), None)
+        if ind_col is None or rev_col is None:
+            return None
+        df["_ind_norm"] = df[ind_col].map(_norm_industry)
+        sub = df[df["_ind_norm"].astype(str).str.contains(str(industry)[:2], na=False)]
+        if sub.empty:
+            # 反向：系统行业名 -> 东财原行业
+            hit = [k for k, v in IND_NAME_MAP.items() if v == industry or industry in v]
+            if hit:
+                sub = df[df[ind_col].astype(str).isin(hit)]
+        if sub.empty or len(sub) < 3:
+            return None
+        n = len(sub)
+        tot_rev = float(pd.to_numeric(sub[rev_col], errors="coerce").fillna(0).sum())
+        if tot_rev <= 0:
+            return None
+        top4 = sub.nlargest(4, rev_col)
+        cr4 = float(top4[rev_col].sum()) / tot_rev * 100.0
+        roe_col = next((c for c in sub.columns if "净资产收益率" in c), None)
+        gm_col = next((c for c in sub.columns if "销售毛利率" in c), None)
+        np_col = next((c for c in sub.columns if "净利润-净利润" in c), None)
+        avg_roe = float(pd.to_numeric(sub[roe_col], errors="coerce").fillna(0).mean()) if roe_col else 0
+        avg_gm = float(pd.to_numeric(sub[gm_col], errors="coerce").fillna(0).mean()) if gm_col else 0
+        tot_profit = float(pd.to_numeric(sub[np_col], errors="coerce").fillna(0).sum()) if np_col else 0
+        npm = tot_profit / tot_rev * 100.0 if tot_rev > 0 else 0
+        result = {
+            "industry_name": industry,
+            "cr4": round(cr4, 2),
+            "avg_roe": round(avg_roe, 2),
+            "net_profit_margin": round(npm, 2),
+            "gross_margin": round(avg_gm, 2),
+            "asset_turnover": 0.0,
+            "equity_multiplier": 1.0,
+            "operating_cash_flow": 0.0,
+            "sample_size": n,
+            "data_as_of": period,
+            "data_source": f"东方财富业绩报表(报告期{period})实时聚合, {n}家样本",
+        }
+        # 写入行业基准表（供后续直接使用）
+        try:
+            conn = _conn()
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO industry_benchmark
+                   (industry_name, cr4, avg_roe, net_profit_margin, asset_turnover,
+                    equity_multiplier, operating_cash_flow, data_source,
+                    gross_margin, sample_size, data_as_of)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(industry_name) DO UPDATE SET
+                     cr4=excluded.cr4, avg_roe=excluded.avg_roe,
+                     net_profit_margin=excluded.net_profit_margin,
+                     asset_turnover=excluded.asset_turnover,
+                     equity_multiplier=excluded.equity_multiplier,
+                     operating_cash_flow=excluded.operating_cash_flow,
+                     data_source=excluded.data_source, gross_margin=excluded.gross_margin,
+                     sample_size=excluded.sample_size, data_as_of=excluded.data_as_of""",
+                (industry, result["cr4"], result["avg_roe"], result["net_profit_margin"],
+                 result["asset_turnover"], result["equity_multiplier"],
+                 result["operating_cash_flow"], result["data_source"],
+                 result["gross_margin"], result["sample_size"], result["data_as_of"]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[data_updater] 行业实时数据写库失败: {e}")
+        return result
+    except Exception as e:
+        print(f"[data_updater] 行业实时抓取失败 {industry}: {e}")
+        return None
+
+
+def fetch_company_live(company_name):
+    """
+    实时抓取指定公司的财务摘要（东方财富 stock_financial_abstract）。
+    供「资料缺口审查」使用：本地库没有该公司时先实时抓取。
+    返回 dict 或 None。
+    """
+    try:
+        from news_fetcher import lookup_stock_code
+        import akshare as ak
+        code = lookup_stock_code(company_name)
+        if not code:
+            return None
+        df = ak.stock_financial_abstract(symbol=code)
+        if df is None or len(df) == 0:
+            return None
+        cols = [c for c in df.columns if str(c).isdigit() and len(str(c)) == 8]
+        if not cols:
+            return None
+        latest = sorted(cols)[-1]
+
+        def pick(name):
+            row = df[df["指标"].astype(str).str.contains(name, na=False)]
+            if row.empty:
+                return None
+            try:
+                return float(row.iloc[0].get(latest))
+            except Exception:
+                return None
+
+        return {
+            "name": company_name,
+            "code": code,
+            "roe": pick("净资产收益率"),
+            "gross_margin": pick("销售毛利率"),
+            "net_margin": pick("销售净利率"),
+            "revenue": pick("营业总收入"),
+            "net_profit": pick("归母净利润"),
+            "eps": pick("基本每股收益"),
+            "data_as_of": latest,
+            "data_source": f"东方财富财务摘要接口实时抓取(报告期{latest})",
+        }
+    except Exception as e:
+        print(f"[data_updater] 公司实时抓取失败 {company_name}: {e}")
+        return None
+
+
 def fetch_performance_report():
     """拉取全市场业绩报表：优先最新报告期。返回 (df, period)。"""
     ak = _ak_import()
