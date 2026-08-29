@@ -482,17 +482,42 @@ def get_chain(industry_name):
 
 def build_chain_payload(industry_name):
     """生成 3D 图用的 payload：nodes/positions/details/hover + matched industry。
-    未收录行业时自动生成「通用五环节产业链结构」，保证 3D 图每次都呈现。"""
+    未收录行业时自动生成「通用五环节产业链结构」，保证 3D 图每次都呈现。
+
+    3D 坐标轴语义（与 3D 图轴标签一一对应）：
+      X 轴 = 产业链环节推进（上游 → 下游，环节序号）
+      Y 轴 = 产业链阶段层级（上游 +1.5 → 服务 -1.5）
+      Z 轴 = 环节利润率中值（%）（从 margin 文本解析，真实数据）
+    """
+    import re
     chain, matched = get_chain(industry_name)
     if not chain:
         chain = build_generic_chain(industry_name)
         matched = None
     n = len(chain)
+    # 阶段 -> 层级高度（Y 轴含义：越靠上游越高）
+    STAGE_LEVEL = {
+        "upstream": 1.5,
+        "midstream": 0.75,
+        "integration": 0.0,
+        "downstream": -0.75,
+        "service": -1.5,
+    }
+
+    def _margin_mid(text):
+        """从 '4%~12%' / '8%~15%' 等利润率文本中提取中值（%）。
+        只匹配带 % 的数字，避免把年份（2024/2025）等误当利润率。"""
+        nums = re.findall(r"(\d+(?:\.\d+)?)\s*%", str(text or ""))
+        if not nums:
+            return 0.0
+        vals = [float(x) for x in nums]
+        return round(sum(vals) / len(vals), 1)
+
     nodes = []
     for i, seg in enumerate(chain):
-        nx = i
-        ny = 0.0 if i % 2 == 0 else (0.6 if i % 4 == 1 else -0.6)
-        nz = i / max(1.0, n - 1)
+        nx = i                       # X：环节推进序号（上游→下游）
+        ny = STAGE_LEVEL.get(seg.get("stage", ""), 0.0)  # Y：阶段层级
+        nz = _margin_mid(seg.get("margin"))              # Z：利润率中值(%)
         nodes.append({
             "id": i,
             "name": seg["name"],
