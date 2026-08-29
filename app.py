@@ -2322,41 +2322,51 @@ with col_main:
                     source=nd["source"],
                     news=_chain_news_text,
                 ) for nd in nodes]
-                fig_3d = go.Figure(data=[go.Scatter3d(
-                    x=xs, y=ys, z=zs,
-                    mode='markers+lines+text',
-                    marker=dict(size=16, color=colors, opacity=0.92,
-                                line=dict(color="white", width=2)),
-                    line=dict(color='#94a3b8', width=5),
-                    text=names,
-                    textposition="top center",
-                    textfont=dict(size=11, color="#1e293b"),
-                    customdata=custom,
-                    hoverinfo='text+customdata',
-                    hovertemplate=(
-                        "<b>%{customdata.stage}</b><br><br>"
-                        "📌 主要业务：%{customdata.business}<br>"
-                        "🏢 龙头/主要企业：%{customdata.leaders}<br>"
-                        "💰 成本特征：%{customdata.cost}<br>"
-                        "📈 利润率：%{customdata.margin}<br>"
-                        "✨ 特点：%{customdata.features}<br>"
-                        "📰 实时动态（网站自动检索）：%{customdata.news}<br>"
-                        "📚 数据来源：%{customdata.source}<extra></extra>"
-                    ),
-                )])
-                _z_axis = dict(showticklabels=False)
-                fig_3d.update_layout(
-                    height=460,
-                    margin=dict(l=0, r=0, b=0, t=10),
-                    scene=dict(
-                        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-                        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-                        zaxis=_z_axis,
-                        camera=dict(eye=dict(x=1.4, y=1.2, z=0.9)),
-                    ),
-                    hoverlabel=dict(font=dict(size=12, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
-                )
-                st.plotly_chart(fig_3d, use_container_width=True, key="industry_3d_chain_chart")
+                try:
+                    fig_3d = go.Figure(data=[go.Scatter3d(
+                        x=xs, y=ys, z=zs,
+                        mode='markers+lines+text',
+                        marker=dict(size=16, color=colors, opacity=0.92,
+                                    line=dict(color="white", width=2)),
+                        line=dict(color='#94a3b8', width=5),
+                        text=names,
+                        textposition="top center",
+                        textfont=dict(size=11, color="#1e293b"),
+                        customdata=custom,
+                        # 注意：Scatter3d 的 hoverinfo 仅支持 x/y/z/text/name，
+                        # 自定义字段请通过 hovertemplate 的 %{customdata.xxx} 引用
+                        hoverinfo='text',
+                        hovertemplate=(
+                            "<b>%{customdata.stage}</b><br><br>"
+                            "📌 主要业务：%{customdata.business}<br>"
+                            "🏢 龙头/主要企业：%{customdata.leaders}<br>"
+                            "💰 成本特征：%{customdata.cost}<br>"
+                            "📈 利润率：%{customdata.margin}<br>"
+                            "✨ 特点：%{customdata.features}<br>"
+                            "📰 实时动态（网站自动检索）：%{customdata.news}<br>"
+                            "📚 数据来源：%{customdata.source}<extra></extra>"
+                        ),
+                    )])
+                    _z_axis = dict(showticklabels=False)
+                    fig_3d.update_layout(
+                        height=460,
+                        margin=dict(l=0, r=0, b=0, t=10),
+                        scene=dict(
+                            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                            zaxis=_z_axis,
+                            camera=dict(eye=dict(x=1.4, y=1.2, z=0.9)),
+                        ),
+                        hoverlabel=dict(font=dict(size=12, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
+                    )
+                    st.plotly_chart(fig_3d, use_container_width=True, key="industry_3d_chain_chart")
+                except Exception as _3d_err:
+                    # 3D 图渲染容错：极少数 plotly 版本兼容性问题时降级为列表展示，不阻断页面
+                    print(f"[3D Chain] 3D 渲染失败，降级为列表展示: {_3d_err}")
+                    st.warning("3D 产业链图在当前环境渲染失败，已降级为文字列表展示。")
+                    for _nd in nodes:
+                        st.markdown(f"**{_nd.get('name', '')}**（{_nd.get('stage', '')}）")
+                        st.caption(f"业务：{_nd.get('business', '')}｜龙头：{_nd.get('leaders', '')}｜利润率：{_nd.get('margin', '')}")
                 if chain.get("matched_industry"):
                     st.caption(f"已匹配行业：**{chain['matched_industry']}** —— {chain.get('note', '')}")
                 else:
