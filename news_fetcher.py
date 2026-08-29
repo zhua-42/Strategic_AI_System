@@ -253,6 +253,63 @@ def search_web_news(keyword, limit=10):
         return {"ok": False, "items": [], "note": f"网络搜索失败: {str(e)[:120]}"}
 
 
+def _resolve_sogou_link(link):
+    """把搜狗跳转链接（/link?url=加密串）还原为可访问的真实地址。
+    搜狗对 /link?url=... 的加密串需要请求其跳转接口解码，失败则返回原链接。"""
+    if not link:
+        return ""
+    if not link.startswith("/link?"):
+        return link
+    import urllib.parse
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+    if q.get("url") and str(q["url"][0]).startswith("http"):
+        return q["url"][0]
+    # 加密跳转：请求搜狗跳转接口拿 Location
+    try:
+        ua = {"User-Agent": UA["User-Agent"], "Referer": "https://www.sogou.com/"}
+        r = requests.get("https://www.sogou.com" + link, headers=ua,
+                         timeout=10, allow_redirects=False)
+        loc = r.headers.get("Location", "")
+        if loc and loc.startswith("http"):
+            return loc
+        if loc.startswith("/link?"):
+            return _resolve_sogou_link(loc)
+    except Exception:
+        pass
+    return link
+
+
+def search_web_pages(keyword, limit=8):
+    """
+    搜狗通用网页搜索（免费、无需 Key）。
+    用于「资料缺口审查」：自动搜索年报 PDF / 行业研报 / 政策原文等资料的获取链接。
+    返回 {"ok", "items": [{"title","url","source","summary"}], "note"}
+    """
+    try:
+        from bs4 import BeautifulSoup
+        params = {"query": keyword}
+        r = requests.get("https://www.sogou.com/web", params=params,
+                         headers=UA, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+        items = []
+        nodes = soup.select(".vrwrap") or soup.select(".rb") or []
+        for node in nodes[:limit]:
+            h3 = node.select_one("h3 a") or node.select_one("h3")
+            if h3 is None:
+                continue
+            title = h3.get_text(strip=True)
+            link = h3.get("href", "") if h3.has_attr("href") else ""
+            src = node.select_one(".citeurl") or node.select_one(".fz-mid")
+            source = src.get_text(strip=True) if src else "搜狗网页"
+            summary_node = node.select_one(".text-layout") or node.select_one(".str_info")
+            summary = summary_node.get_text(strip=True) if summary_node else ""
+            items.append({"title": title, "date": "", "source": source,
+                          "url": _resolve_sogou_link(link), "summary": summary[:200]})
+        return {"ok": True, "items": _norm(items), "note": f"搜狗网页搜索 · {keyword}"}
+    except Exception as e:
+        return {"ok": False, "items": [], "note": f"网页搜索失败: {str(e)[:120]}"}
+
+
 # ---------------------------------------------------------------- 代码查询
 def lookup_stock_code(company_name):
     """公司名称 -> 股票代码（akshare 全市场名单，带缓存）。"""
