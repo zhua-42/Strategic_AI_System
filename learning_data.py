@@ -54,25 +54,47 @@ def init_learning_schema():
     conn.close()
 
 
+# 幂等 schema 保护：所有数据库函数调用前先确保表结构完整
+# （解决旧库缺 used_count 列导致 "no such column: used_count" 的问题）
+_SCHEMA_READY = False
+
+
+def _ensure_schema():
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    try:
+        init_learning_schema()
+        _SCHEMA_READY = True
+    except Exception as e:
+        print(f"[learning_data] schema 初始化失败: {e}")
+
+
 def mark_used(titles, agent="Report Agent"):
-    """记录某份资料被某个 Agent 调用（用于展示系统学习使用情况）。"""
+    """记录某份资料被某个 Agent 调用（用于展示系统学习使用情况）。
+    容错设计：即使记录失败（如旧库缺列）也绝不阻断投研主流程。"""
     if not titles:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for t in titles:
-        if not t:
-            continue
-        cur.execute(
-            "UPDATE learning_resources SET used_count = COALESCE(used_count,0)+1, last_used=?, last_used_by=? WHERE title=?",
-            (now, agent, t),
-        )
-    conn.commit()
-    conn.close()
+    _ensure_schema()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for t in titles:
+            if not t:
+                continue
+            cur.execute(
+                "UPDATE learning_resources SET used_count = COALESCE(used_count,0)+1, last_used=?, last_used_by=? WHERE title=?",
+                (now, agent, t),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[learning_data] mark_used 记录失败（不影响主流程）: {e}")
 
 
 def get_usage_stats():
+    _ensure_schema()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
@@ -97,6 +119,7 @@ def _norm_tags(tags):
 
 
 def upsert_resource(title, source, resource_type, summary, tags, file_path, file_size=0):
+    _ensure_schema()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT id FROM learning_resources WHERE title=?", (title,))
@@ -123,6 +146,7 @@ def upsert_resource(title, source, resource_type, summary, tags, file_path, file
 
 
 def search_resources(keyword="", tag="", limit=100):
+    _ensure_schema()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     sql = "SELECT id, title, source, resource_type, summary, tags, file_path, file_size, created_at FROM learning_resources WHERE 1=1"
@@ -149,6 +173,7 @@ def search_resources(keyword="", tag="", limit=100):
 
 
 def count_resources():
+    _ensure_schema()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
