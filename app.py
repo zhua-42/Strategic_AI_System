@@ -863,25 +863,40 @@ def get_judge_reference(industry):
 # ============================================================
 # 🔗 资料缺口自动补链（缺口 → 分析需要什么 → 搜索可获取链接）
 # ============================================================
-# 官方固定入口（100% 可用，无需搜索）：按缺口类型给出权威获取地址
+# 官方固定入口（100% 可用，无需搜索）：按缺口类型给出权威获取地址。
+# 优先使用「带检索参数的直达下载页」——用户点进去即见可下载的文件列表。
+def _cninfo_search_url(kw):
+    """巨潮资讯网公告检索直达页（带关键词，点开即见公告列表，每条可下载 PDF）。"""
+    import urllib.parse
+    return ("http://www.cninfo.com.cn/new/fulltextSearch?notautosubmit=&keyWord="
+            + urllib.parse.quote(kw) + "&sdate=&edate=&isfulltext=false&sortName=pubdate"
+            "&sortType=desc&pageNum=1")
+
+
+def _em_report_url(kw):
+    """东方财富研报/公告检索直达页。"""
+    import urllib.parse
+    return ("https://so.eastmoney.com/news/s?keyword=" + urllib.parse.quote(kw))
+
+
 OFFICIAL_SOURCE_LINKS = {
     "年报": [
-        ("巨潮资讯网（法定披露平台·年报/公告 PDF 下载）", "http://www.cninfo.com.cn/new/index"),
+        ("巨潮资讯网 · 公告检索（点开即见年报/公告，每条可下载 PDF）", "http://www.cninfo.com.cn/new/fulltextSearch"),
         ("上交所官网（沪市公司定期报告）", "http://www.sse.com.cn/assortment/stock/list/info/announcement/"),
         ("深交所官网（深市公司定期报告）", "http://www.szse.cn/disclosure/listed/bulletinDetail/index.html"),
     ],
     "财务": [
-        ("巨潮资讯网（年报/半年报/财务数据）", "http://www.cninfo.com.cn/new/index"),
-        ("东方财富数据中心（业绩报表）", "https://data.eastmoney.com/bbsj/"),
-        ("新浪财经（公司财务摘要）", "https://finance.sina.com.cn/stock/"),
+        ("巨潮资讯网 · 公告检索（含定期报告 PDF 下载）", "http://www.cninfo.com.cn/new/fulltextSearch"),
+        ("东方财富数据中心 · 业绩报表", "https://data.eastmoney.com/bbsj/"),
+        ("新浪财经 · 公司财务摘要", "https://finance.sina.com.cn/stock/"),
     ],
     "行业": [
-        ("东方财富行业研报中心", "https://data.eastmoney.com/report/industry.jshtml"),
+        ("东方财富 · 研报中心（行业研报 PDF 下载）", "https://data.eastmoney.com/report/industry.jshtml"),
         ("慧博投研资讯（行业研报）", "https://www.hibor.com.cn/"),
         ("发现报告（行业研究报告）", "https://www.fxbaogao.com/"),
     ],
     "政策": [
-        ("中国政府网（政策文件库）", "https://www.gov.cn/zhengce/"),
+        ("中国政府网 · 政策文件库（PDF/原文下载）", "https://www.gov.cn/zhengce/"),
         ("工信部官网（产业政策）", "https://www.miit.gov.cn/"),
         ("国家发改委（产业政策与规划）", "https://www.ndrc.gov.cn/"),
     ],
@@ -891,13 +906,13 @@ OFFICIAL_SOURCE_LINKS = {
         ("新浪财经新闻", "https://finance.sina.com.cn/"),
     ],
     "研报": [
-        ("东方财富研报中心", "https://data.eastmoney.com/report/"),
+        ("东方财富研报中心（PDF 下载）", "https://data.eastmoney.com/report/"),
         ("慧博投研资讯", "https://www.hibor.com.cn/"),
         ("发现报告", "https://www.fxbaogao.com/"),
     ],
     "风险": [
         ("证监会（监管与风险提示）", "http://www.csrc.gov.cn/"),
-        ("巨潮资讯（公司公告含风险提示）", "http://www.cninfo.com.cn/new/index"),
+        ("巨潮资讯（公司公告含风险提示）", "http://www.cninfo.com.cn/new/fulltextSearch"),
     ],
 }
 
@@ -934,8 +949,9 @@ def _gap_type_of(item_text):
 def suggest_gap_sources(gap_item, company_name="", industry="", year="2025"):
     """
     为单个资料缺口自动生成「获取资料链接」：
-    1) 官方固定入口（巨潮/交易所/政府网等，按资料类型）
-    2) 自动搜索（搜狗网页搜索，按缺口类型生成关键词）
+    1) 直达下载页（巨潮/东财公告检索带关键词，点开即见可下载 PDF 的公告列表）
+    2) 官方固定入口（巨潮/交易所/政府网等，按资料类型）
+    3) 自动搜索（搜狗网页搜索，按缺口类型生成关键词）
     返回 {"official": [{"name","url"}], "search": [{"title","url","source"}], "note": str}
     """
     item_text = str(gap_item.get("item", ""))
@@ -948,10 +964,40 @@ def suggest_gap_sources(gap_item, company_name="", industry="", year="2025"):
     else:
         kw_entity = company_name or industry or base_kw or item_text
 
-    # 1) 官方固定入口
-    official = OFFICIAL_SOURCE_LINKS.get(gap_type, OFFICIAL_SOURCE_LINKS["研报"])
+    # 1) 直达下载页：带关键词的公告/报告检索（点开即见可下载列表）
+    direct = []
+    try:
+        _kw_enc = kw_entity.replace("行业", "").replace("基准", "").strip() or kw_entity
+        direct.append(("巨潮资讯 · 「%s」公告检索（直达：点开每条即可下载 PDF）" % _kw_enc,
+                       _cninfo_search_url(_kw_enc)))
+        direct.append(("东方财富 · 「%s」资讯检索（直达）" % _kw_enc,
+                       _em_report_url(_kw_enc)))
+    except Exception:
+        pass
 
-    # 2) 自动搜索
+    # 1.5) 若知道公司代码：尝试用公告接口拿「公告详情页」（页内有 PDF 下载按钮）
+    direct_pages = []
+    if company_name and gap_type in ("年报", "财务"):
+        try:
+            _code = nf.lookup_stock_code(company_name)
+            if _code:
+                _ann = nf.fetch_company_announcements(company_name, stock_code=_code, days=90)
+                for _it in (_ann.get("items") or [])[:3]:
+                    _u = _it.get("url", "")
+                    if _u and _u.startswith("http"):
+                        direct_pages.append({
+                            "title": _it.get("title", "")[:40] + "（公告详情·可下载PDF）",
+                            "url": _u,
+                        })
+        except Exception:
+            pass
+
+    # 2) 官方固定入口
+    official = OFFICIAL_SOURCE_LINKS.get(gap_type, OFFICIAL_SOURCE_LINKS["研报"])
+    if direct:
+        official = direct + official
+
+    # 3) 自动搜索
     tmpl = _GAP_KEYWORD_TMPL.get(gap_type, _GAP_KEYWORD_TMPL["研报"])
     search_kw = tmpl.format(kw=kw_entity, year=year).strip()
     if company_name and "年报" in tmpl:
@@ -964,9 +1010,9 @@ def suggest_gap_sources(gap_item, company_name="", industry="", year="2025"):
         search = []
         note = f"自动搜索失败: {str(e)[:80]}"
     if not search:
-        note = "自动搜索暂无结果（网络受限时请使用右侧官方入口）"
-    return {"official": official, "search": search, "note": note,
-            "search_kw": search_kw, "type": gap_type}
+        note = "自动搜索暂无结果（网络受限时请使用上方官方入口）"
+    return {"official": official, "search": search, "direct_pages": direct_pages,
+            "note": note, "search_kw": search_kw, "type": gap_type}
 
 # ============================================================
 # 🌟 真实风险雷达（基于真实财务指标映射，口径透明可溯）🌟
@@ -1062,8 +1108,12 @@ def compute_risk_radar(company_data=None, db_data=None):
 # ============================================================
 def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, rag_ok=True):
     """
-    模拟 Data Planning / Data Retrieval 的缺口审查：
-    对每项期望数据，检查本地数据库/RAG/上传件，输出缺口清单（含原因与建议）。
+    Data Planning / Data Retrieval 缺口审查（三级探测）：
+    1) 本地数据库 / RAG / 上传件；
+    2) 实时数据源（东方财富业绩报表实时聚合行业基准、财务摘要实时抓取个股指标）；
+    3) 网络搜索验证（搜狗网页搜索确认资料可得性）。
+    只有三级都失败才标记「缺失」，并在 reason 中说明已尝试的渠道，
+    避免"库里没有就武断说没有"。
     返回 list[{"item","status","reason","suggest"}]
     """
     conn = sqlite3.connect("financial_research.db")
@@ -1077,6 +1127,38 @@ def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, r
         except Exception:
             return False
 
+    def _try_live_industry(ind):
+        """实时抓取行业基准：成功返回 (data, note)，失败返回 (None, note)。"""
+        try:
+            import data_updater as _du
+            _r = _du.fetch_industry_live(ind)
+            if _r and _r.get("sample_size", 0) >= 3:
+                return _r, f"已通过东方财富业绩报表实时聚合成功（样本 {_r['sample_size']} 家，报告期 {_r.get('data_as_of','')}）"
+            return None, "实时聚合失败：该行业在东方财富业绩报表中匹配样本不足 3 家"
+        except Exception as e:
+            return None, f"实时聚合异常：{str(e)[:60]}"
+
+    def _try_live_company(cname):
+        """实时抓取个股财务摘要：成功返回 (data, note)，失败返回 (None, note)。"""
+        try:
+            import data_updater as _du
+            _r = _du.fetch_company_live(cname)
+            if _r and _r.get("roe") is not None:
+                return _r, f"已通过东方财富财务摘要接口实时抓取成功（报告期 {_r.get('data_as_of','')}）"
+            return None, "实时抓取失败：未找到该公司股票代码或财务摘要不可用"
+        except Exception as e:
+            return None, f"实时抓取异常：{str(e)[:60]}"
+
+    def _try_search_verify(kw):
+        """网络搜索验证资料可得性。返回 (bool, note)。"""
+        try:
+            _r = nf.search_web_pages(kw, limit=3)
+            if _r.get("items"):
+                return True, f"网络检索确认可得（搜狗网页搜索命中 {len(_r['items'])} 条，见下方链接）"
+            return False, "网络检索未命中"
+        except Exception as e:
+            return False, f"网络检索异常：{str(e)[:50]}"
+
     if is_company_mode and company_name:
         # 公司向数据清单
         try:
@@ -1086,11 +1168,25 @@ def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, r
             has_comp = False
         if has_comp:
             gaps.append({"item": f"{company_name} 财务指标（ROE/利润率/周转/乘数）", "status": "ok",
-                          "reason": "已从本地财务数据库/业绩报表锁定（最新报告期）", "suggest": ""})
+                          "reason": "已从本地财务数据库/456行业数据导入锁定（最新报告期）", "suggest": ""})
         else:
-            gaps.append({"item": f"{company_name} 财务指标", "status": "missing",
-                          "reason": "本地数据库暂无该公司；实时行情接口当前不可达（数据供应商限制），无法自动抓取",
-                          "suggest": "请上传年报 PDF 或财务数据表（XLSX/CSV），系统将自动解析入库"})
+            # 二级：实时抓取
+            _live, _live_note = _try_live_company(company_name)
+            if _live:
+                gaps.append({"item": f"{company_name} 财务指标", "status": "ok",
+                              "reason": _live_note + "；ROE/毛利率/净利率/EPS 已实时获取",
+                              "suggest": ""})
+            else:
+                # 三级：网络搜索验证
+                _ok, _snote = _try_search_verify(f"{company_name} 年报 PDF 下载 巨潮资讯")
+                if _ok:
+                    gaps.append({"item": f"{company_name} 财务指标", "status": "partial",
+                                  "reason": f"本地库暂无该公司；{_live_note}；{_snote}（年报可在巨潮资讯网下载）",
+                                  "suggest": "下载年报后上传，或直接上传财务数据表（XLSX/CSV）自动解析入库"})
+                else:
+                    gaps.append({"item": f"{company_name} 财务指标", "status": "missing",
+                                  "reason": f"已尝试：本地数据库、东方财富财务摘要实时接口、网络检索（均未取得）；{_snote}",
+                                  "suggest": "请上传年报 PDF 或财务数据表（XLSX/CSV），系统将自动解析入库"})
         gaps.append({"item": "同行业可比公司数据", "status": "partial",
                       "reason": "行业基准为全市场聚合（样本数≥3），可比公司清单未单独维护",
                       "suggest": "可选：上传可比公司对照表以获得更强基准"})
@@ -1098,16 +1194,30 @@ def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, r
         # 行业向数据清单
         if _has_industry(industry_name):
             gaps.append({"item": f"{industry_name} 行业基准（CR4/ROE/净利率/毛利率）", "status": "ok",
-                          "reason": "来自东方财富业绩报表全市场聚合（报告期见数据截止标注）", "suggest": ""})
+                          "reason": "来自东方财富业绩报表全市场聚合或 456 行业数据导入（报告期见数据截止标注）", "suggest": ""})
         else:
-            gaps.append({"item": f"{industry_name} 行业基准数据", "status": "missing",
-                          "reason": "本地行业库暂无该行业，且实时接口当前不可达",
-                          "suggest": "请上传行业研报 PDF 或行业数据表"})
+            # 二级：实时聚合行业基准（关键改进：库中没有 ≠ 没有数据）
+            _live, _live_note = _try_live_industry(industry_name)
+            if _live:
+                gaps.append({"item": f"{industry_name} 行业基准（CR4/ROE/净利率/毛利率）", "status": "ok",
+                              "reason": _live_note + "；已实时聚合写入本地行业基准库",
+                              "suggest": ""})
+            else:
+                # 三级：网络搜索验证
+                _ok, _snote = _try_search_verify(f"{industry_name} 行业研究报告 PDF 下载")
+                if _ok:
+                    gaps.append({"item": f"{industry_name} 行业基准数据", "status": "partial",
+                                  "reason": f"本地行业库暂无该行业；{_live_note}；{_snote}（行业研报可在研报平台下载）",
+                                  "suggest": "上传行业研报 PDF 或行业数据表；或直接开始研究（系统将用大盘估算）"})
+                else:
+                    gaps.append({"item": f"{industry_name} 行业基准数据", "status": "missing",
+                                  "reason": f"已尝试：本地行业库、东方财富业绩报表实时聚合、网络检索（均未取得）；{_snote}",
+                                  "suggest": "请上传行业研报 PDF 或行业数据表"})
         gaps.append({"item": "行业市场规模与增速", "status": "partial",
-                      "reason": "规模/增速为估算口径（市场公开区间），无付费数据源",
-                      "suggest": "上传行业研究机构报告可替换为权威口径"})
+                      "reason": "规模/增速为估算口径（市场公开区间）；系统已自动检索研报链接供获取权威口径",
+                      "suggest": "上传行业研究机构报告可替换为权威口径（见下方自动获取链接）"})
         gaps.append({"item": "政策与风险数据", "status": "partial",
-                      "reason": "政策库仅覆盖部分行业；政策原文为公开信息但无结构化订阅源",
+                      "reason": "政策库仅覆盖部分行业；系统已自动检索政策原文链接（见下方自动获取链接）",
                       "suggest": "上传政策原文/风险事件清单（PDF/TXT）即可入库"})
 
     # 共同项
@@ -2062,8 +2172,13 @@ with col_main:
                         _src_meta = suggest_gap_sources(g, company_name=st.session_state.get("precheck_company", ""),
                                                         industry=st.session_state.get("precheck_industry", ""))
                         st.caption(f"📋 系统分析：该项需要 **{_src_meta['type']}** 类资料，已按「{_src_meta['search_kw']}」检索")
-                        # 官方固定入口
-                        st.markdown("**🏛️ 官方权威入口（推荐，100% 可访问）**")
+                        # 该公司公告详情直达页（页内有 PDF 下载按钮）
+                        if _src_meta.get("direct_pages"):
+                            st.markdown("**📄 该公司近期公告（点开即可下载 PDF）**")
+                            for _dp in _src_meta["direct_pages"][:3]:
+                                st.markdown(f"- [{_dp['title']}]({_dp['url']})")
+                        # 直达下载页 + 官方入口
+                        st.markdown("**🏛️ 直达下载页 / 官方权威入口（推荐）**")
                         for _name, _url in _src_meta["official"]:
                             st.markdown(f"- [{_name}]({_url})")
                         # 自动搜索结果
