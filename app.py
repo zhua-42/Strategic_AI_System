@@ -1380,6 +1380,19 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     """
     行业大盘与个股对标协同流水线
     """
+    # ============================================================
+    # 🚀 用户可见的实时进度条（7-Agent 流水线全程可视化）
+    # ============================================================
+    _progress_bar = st.progress(0.0, text="🚀 正在启动 7-Agent 投研流水线...")
+
+    def _set_progress(pct, label):
+        """更新进度条：pct 为 0~100 数值，label 为当前阶段说明。"""
+        try:
+            _progress_bar.progress(min(max(float(pct), 0.0), 100.0) / 100.0,
+                                   text=f"{label}　【{min(max(float(pct), 0.0), 100.0):.0f}%】")
+        except Exception:
+            pass
+
     # 各 Agent 耗时统计（用于使用数据看板）
     _stage_last_t = time.time()
     _last_agent = None
@@ -1396,10 +1409,12 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
 
     status_callback = _timed_status_cb
     # 🌟 核心修复一：行业智能对齐与自适应路由算法 🌟
+    _set_progress(3, "🎯 行业智能对齐与路由")
     aligned_industry = auto_align_industry(company_name, user_input)
     db_data = get_locked_data(aligned_industry)
 
     # 📰 实时新闻与公告抓取（网站自身搜索能力：公告/快讯/网络搜索）
+    _set_progress(6, "📰 正在抓取实时新闻与公告（东方财富/搜狗/财新）")
     log_callback("📰 [News Engine] 正在抓取实时新闻与公告（东方财富/搜狗/财新）...")
     _news_kw = company_name or aligned_industry
     _news_bundle = nf.fetch_news_bundle(company_name=company_name, industry=aligned_industry,
@@ -1408,6 +1423,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     log_callback(f"📰 [News Engine] 抓取到 {len(news_items)} 条实时新闻/公告（{_news_bundle.get('note', '')}）")
 
     # 🌐 网页图表数据读取（当新闻带链接时，尝试读取正文/表格/图表数据）
+    _set_progress(10, "🌐 读取新闻网页正文 / 表格 / 图表数据")
     web_page_summary = ""
     for _nit in news_items[:3]:
         _u = _nit.get("url", "")
@@ -1422,11 +1438,13 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         log_callback("🌐 [Web Reader] 暂无可用网页详情（网络受限时跳过，不影响主流程）。")
 
     # 🏆 龙头公司横向对比（3~4 家，真实财务摘要 + 兜底基准）
+    _set_progress(13, "🏆 龙头公司横向对比（3~4 家 · 真实财务摘要）")
     leader_payload = lc.build_leader_payload(aligned_industry)
     if leader_payload.get("ok"):
         log_callback(f"🏆 [Leader Compare] 龙头对比已生成：{'、'.join(leader_payload.get('companies', [])[:4])}")
 
     # 🧠 系统方法库调用：按研究任务自动检索注入学习资料（Forage 案例 + 行研方法论）
+    _set_progress(16, "🧠 检索系统方法论知识库（Forage 案例 + 行研方法论）")
     _rt = "公司研究" if company_name else "行业研究"
     _method_domains = method_domain_for(_rt, purpose, report_type)
     _method_brief, _method_used = method_brief(
@@ -1496,6 +1514,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
             financial_prompt += f"\n\n【实时新闻与公告（可引用）】\n{nf.format_items_markdown(news_items, max_items=6)}"
 
     # 向量数据库检索 (RAG 闭环)
+    _set_progress(18, "🔍 知识库向量检索（RAG 底稿对齐）")
     log_callback("🔍 [RAG Engine] 正在进行向量库高维度特征检索对齐...")
     rag_context = vector_search(aligned_industry, top_k=3)
     # 用户上传的年报文本作为补充参考资料进入 RAG 上下文
@@ -1505,11 +1524,13 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     log_callback("✅ [RAG Engine] 本地向量数据库检索对齐完成！")
     
     # 1. Planner Agent
+    _set_progress(22, "📋 Planner Agent：制定研究提纲")
     status_callback("Planner", "running")
     log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
     time.sleep(1)
     
     # 2. Research Agent（支持实时新闻/网页图表工具）
+    _set_progress(30, "🔍 Research Agent：行业竞争格局与 CR4 分析")
     status_callback("Research", "running")
     log_callback("🔍 [Research Agent] 查询大盘，融合数据库，构建竞争集中度 (CR4) 指标...")
     research_prompt = f"根据以下行业数据库信息，结合研究周期【{period}】完成行业竞争格局分析。行业: {db_data['industry_name']}, CR4: {db_data['cr4']}%"
@@ -1542,6 +1563,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         res_research = _res_msg.content
     
     # 3. Financial Agent (支持 DCF 工具调用)
+    _set_progress(42, "📊 Financial Agent：杜邦分解 + DCF 估值")
     status_callback("Financial", "running")
     log_callback("📊 [Financial Agent] 计算杜邦公式与 DCF 模型，并进行审计诊断...")
     financial_messages = [
@@ -1578,6 +1600,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         res_financial = message.content
 
     # 4. Policy Agent（注入最新新闻/公告与网页数据作为政策背景）
+    _set_progress(52, "📜 Policy Agent：政策与合规拆解")
     status_callback("Policy", "running")
     log_callback("📜 [Policy Agent] 精细化政策拆解：行业限制、税收优惠及环保壁垒...")
     _news_ctx = nf.format_items_markdown(news_items, max_items=6) if news_items else "（无实时新闻）"
@@ -1589,6 +1612,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     ).choices[0].message.content
 
     # 5. Risk Agent（注入实时新闻/公告中的风险事件线索）
+    _set_progress(60, "🚩 Risk Agent：核心风险扫描")
     status_callback("Risk", "running")
     log_callback("🚩 [Risk Agent] 核心风险扫描...")
     risk_prompt = (f"请分析：行业: {db_data['industry_name']}的财务与政策风险。参考底稿: {rag_context}"
@@ -1600,6 +1624,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     ).choices[0].message.content
    
     # 🌟 核心修复二：学术级智能体多边辩论机制 (Financial Agent vs Risk Agent) 🌟
+    _set_progress(68, "💬 多空辩论：Financial 专家 vs Risk 审计专家")
     log_callback("💬 [Debate] 审计对立碰撞启动：Financial 专家 与 Risk 审计专家辩论会...")
     time.sleep(1)
     
@@ -1630,6 +1655,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     log_callback(f"🚩 [Risk Agent Rebuttal]: 反驳成立！高杠杆及应收账款周转放缓，经营现金流存在重大隐性流失。")
 
     # 🌟 核心修复三：专家委员会 Agent 终审、矛盾消除与数据可信度证据链 (Evidence Ledger) 🌟
+    _set_progress(78, "⚖️ 专家委员会终审：矛盾消除 + 证据链审定")
     status_callback("Judge", "running")
     log_callback("⚖️ [Committee Agent] 专家委员会正在进行矛盾消除、逻辑排歧与可信等级审定...")
     judge_reference = get_judge_reference(db_data["industry_name"])
@@ -1688,6 +1714,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         ]
 
     # 7. Report Agent
+    _set_progress(88, "✍️ Report Agent：研报总装与图表生成")
     status_callback("Report", "running")
     log_callback("✍️ [Report Agent] 研报总装中，整合对标成果与 RAG 深度分析...")
     _write_brief, _write_used = method_brief(["写作规范"], query_hint=f"{aligned_industry} 研报 {report_type}")
@@ -1832,6 +1859,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
 
     final_text = f"{res_report}\n\n```json\n{json.dumps(chart_data)}\n```"
     log_callback("✅ 工作流执行完毕。智能投研报告及图表已就绪！")
+    _set_progress(100, "✅ 研报生成完成，正在渲染图表与导出选项…")
     if _last_agent is not None:
         pf.record_agent_time(_last_agent, round(time.time() - _stage_last_t, 2))
     return final_text
@@ -1977,6 +2005,10 @@ with col_main:
                 report_type=report_type
             )
         except Exception as _run_error:
+            try:
+                st.progress(1.0, text=f"❌ 研究流程执行失败：{str(_run_error)[:80]}")
+            except Exception:
+                pass
             st.error(f"研究流程执行失败：{_run_error}")
             st.stop()
         _run_elapsed = time.time() - _run_started
