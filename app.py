@@ -1527,6 +1527,7 @@ if workbench_page != "AI 研究报告":
         chain_builder=icd.build_chain_payload,
         news_fetcher=nf,
         webpage_reader=wr.read_webpage,
+        pdf_exporter=rex.export_pdf,
     )
     st.stop()
 if not api_available:

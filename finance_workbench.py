@@ -468,7 +468,8 @@ def source_guidance(mode: str) -> str:
     return SOURCE_MODES.get(mode, SOURCE_MODES["用户上传优先"])
 
 
-def render_workbench(st: Any, page: str, chain_builder: Any = None, news_fetcher: Any = None, webpage_reader: Any = None) -> None:
+def render_workbench(st: Any, page: str, chain_builder: Any = None, news_fetcher: Any = None,
+                     webpage_reader: Any = None, pdf_exporter: Any = None) -> None:
     """Render the additive workbench pages without changing the legacy flow."""
     st.title("分析工作台")
     st.caption("通用输入、来源可追溯、模型可切换。未填入官方或用户数据的字段会明确标记为待核实。")
@@ -526,6 +527,23 @@ def render_workbench(st: Any, page: str, chain_builder: Any = None, news_fetcher
             cim_text = "# Confidential Information Memorandum\n\n" + "\n".join(f"## {idx}. {section}\n\n待补充经核实数据、来源与管理层访谈记录。" for idx, section in enumerate(materials["cim_sections"], 1))
             st.download_button("下载匿名 One-pager", materials["teaser"].encode("utf-8"), "anonymous_teaser.md", "text/markdown", key="wb_teaser_md")
             st.download_button("下载 CIM 草稿目录", cim_text.encode("utf-8"), "cim_draft.md", "text/markdown", key="wb_cim_md")
+            if pdf_exporter:
+                try:
+                    import report_export as _rex
+                    _valuation_png = _rex.render_chart_png(
+                        "capability_compare",
+                        {"metrics": ["Bear EV", "Base EV", "Bull EV", "LBO 入场 EV"],
+                         "values": [float(dcf["scenarios"][s]["enterprise_value"]) for s in ["Bear", "Base", "Bull"]] + [float(lbo["entry_ev"])]},
+                        title="交易材料估值区间（$M）",
+                    )
+                    _meta = {"研究主体": company, "报告类型": "交易材料 / 匿名 One-pager / CIM 草稿",
+                             "分析周期": "用户输入与模型情景", "数据口径": "用户输入、模型假设和待核验可比公司数据"}
+                    _pdf = pdf_exporter(company, materials["teaser"] + "\n\n" + cim_text,
+                                        {"valuation": {"title": "交易材料估值区间", "caption": "Bear/Base/Bull DCF 与 LBO 入场企业价值；正式材料需替换为可审计来源。", "png": _valuation_png, "source": "用户输入与模型假设；可比公司数据需逐行核验"}},
+                                        gap_data=["可比公司行情和经审计财务仍需补充", "管理层访谈和买方名单需人工核验"], meta=_meta)
+                    st.download_button("下载匿名 One-pager / CIM PDF", _pdf, "transaction_materials.pdf", "application/pdf", key="wb_deal_pdf")
+                except Exception as _pdf_err:
+                    st.caption(f"交易材料 PDF 暂不可用：{str(_pdf_err)[:100]}")
         bundle = {"summary": summary_rows, "comps": peers, "dcf": dcf, "lbo": lbo, "sources": [{"source": source_mode, "as_of": str(date.today()), "note": "正式交易材料需替换为经审计和可引用来源"}]}
         xlsx = workbook_bytes(bundle)
         if xlsx:
