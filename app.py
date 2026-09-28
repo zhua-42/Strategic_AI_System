@@ -5,15 +5,21 @@ import sqlite3
 import io
 import urllib3
 import random
+import datetime as _dt
 from dotenv import load_dotenv
 from openai import OpenAI
 import streamlit as st
 import plotly.graph_objects as go
 from docx import Document  # 用于生成Word文档
 from docx.shared import Inches  # 用于Word文档中精细调整图表大小
-import akshare as ak
+try:
+    import akshare as ak  # optional: data_updater/news_fetcher import it on demand
+except Exception as _akshare_error:
+    ak = None
+    print(f"[Data] akshare 不可用，将使用本地数据或用户上传: {_akshare_error}")
 import pdfplumber  # 导入推荐技术栈中的 PDF 处理库
 import pandas as pd
+from chart_utils import apply_plotly_theme, PLOTLY_CONFIG, sanitize_json
 
 # ============================================================
 # chromadb 兼容层（云端环境修复）
@@ -42,8 +48,30 @@ def _ensure_chromadb_sqlite():
 
 
 _ensure_chromadb_sqlite()
-import chromadb
-from sentence_transformers import SentenceTransformer
+# These packages are large and are only needed by the optional semantic RAG
+# path.  Keep them completely lazy so the Streamlit first paint does not wait
+# for torch/Chroma imports; the background RAG worker loads them when needed.
+chromadb = None
+SentenceTransformer = None
+_RAG_DEPENDENCIES_ATTEMPTED = False
+
+
+def _ensure_rag_dependencies():
+    global chromadb, SentenceTransformer, _RAG_DEPENDENCIES_ATTEMPTED
+    if _RAG_DEPENDENCIES_ATTEMPTED:
+        return chromadb is not None and SentenceTransformer is not None
+    _RAG_DEPENDENCIES_ATTEMPTED = True
+    try:
+        import chromadb as _chromadb
+        chromadb = _chromadb
+    except Exception as exc:
+        print(f"[chromadb] optional import failed: {exc}")
+    try:
+        from sentence_transformers import SentenceTransformer as _SentenceTransformer
+        SentenceTransformer = _SentenceTransformer
+    except Exception as exc:
+        print(f"[RAG] optional embedding import failed: {exc}")
+    return chromadb is not None and SentenceTransformer is not None
 import product_features as pf
 import industry_chain_data as icd
 import report_export as rex
@@ -52,6 +80,7 @@ import learning_data as ldata
 import news_fetcher as nf
 import web_reader as wr
 import leader_compare as lc
+import finance_workbench as fw
 
 # --- 1. 基础配置与环境加载 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -73,16 +102,16 @@ if not api_key:
     api_key = os.getenv("DEEPSEEK_API_KEY")
 
 # 3. 【自我诊断工具】在页面侧边栏打印当前加载状态（排查后可自行删除）
-if not api_key or api_key.strip() in ["your-api-key", ""]:
-    st.error("⚠️ 【诊断提示】系统目前读取到的 API Key 依然为空或默认占位符！这说明您的配置未生效，请检查 Streamlit Secrets 或 `.env`。")
-    st.stop()
+api_available = bool(api_key and api_key.strip() not in ["your-api-key", ""])
+if not api_available:
+    # 估值、可比公司、产业链和工作簿页面不依赖 LLM，允许离线使用。
+    st.warning("⚠️ 未配置 DeepSeek API Key：AI 研究报告页面不可用，但本地估值、可比公司、DCF、财报模板和产业链页面仍可使用。")
 else:
-    # 仅展示前4位和总长度，确保密钥安全
-    st.sidebar.success(f"🔑 密钥载入成功 (长度: {len(api_key)}位, 开头: {api_key[:4]}...)")
+    st.sidebar.success("🔑 API 密钥已载入（内容不会展示）")
 
 # 4. 初始化 OpenAI 客户端
 client = OpenAI(
-    api_key=api_key,
+    api_key=api_key or "missing-key",
     base_url="https://api.deepseek.com"  # 建议改为官方标准的 base_url，避免带 /v1 导致请求路径叠加
 )
 
@@ -104,7 +133,7 @@ client.chat.completions.create = _tracked_create
 def init_database():
     conn = sqlite3.connect("financial_research.db")
     cursor = conn.cursor()
-    
+
     # 行业基准表（含真实数据底座扩展列）
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS industry_benchmark (
@@ -121,7 +150,7 @@ def init_database():
             data_as_of TEXT DEFAULT ''
         )
     """)
-    
+
     # 个股财务数据表 (承接 Excel 导入)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS company_financial (
@@ -142,7 +171,7 @@ def init_database():
             data_source TEXT DEFAULT ''
         )
     """)
-    
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS policy_benchmark (
             industry_name TEXT PRIMARY KEY,
@@ -165,7 +194,7 @@ def init_database():
         cursor.execute("""
             INSERT INTO industry_benchmark
             (industry_name, cr4, avg_roe, net_profit_margin, asset_turnover, equity_multiplier, operating_cash_flow, data_source)
-            VALUES 
+            VALUES
             ('白酒行业', 72.5, 28.4, 38.5, 0.65, 1.13, 450.0, '巨潮资讯 - 贵州茅台/五粮液2025财报'),
             ('房地产', 35.2, 4.2, 5.1, 0.22, 4.80, -120.0, '深交所问询函及万科A公开报告'),
             ('家电制造', 55.4, 18.2, 12.1, 0.85, 1.77, 280.0, '巨潮资讯 - 格力电器2025报告'),
@@ -180,7 +209,7 @@ def init_database():
         INSERT OR REPLACE INTO risk_benchmark VALUES
         ('新能源汽车', '价格战、供应链风险、电池原材料波动', '中等', '行业研究报告')
     """)
-    
+
     conn.commit()
     conn.close()
 
@@ -197,15 +226,15 @@ def import_financial_excel():
     excel_path = "knowledge/financial_report/company_financial.xlsx"
     conn = sqlite3.connect("financial_research.db")
     cursor = conn.cursor()
-    
+
     if os.path.exists(excel_path):
         try:
             df = pd.read_excel(excel_path)
             df.columns = [c.strip() for c in df.columns]
-            
+
             for _, row in df.iterrows():
                 cursor.execute("""
-                    INSERT OR REPLACE INTO company_financial 
+                    INSERT OR REPLACE INTO company_financial
                     (company_name, industry, year, roe, margin, turnover, multiplier, cashflow, pain_point)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
@@ -215,7 +244,7 @@ def import_financial_excel():
                     float(row.get('ROE', 0)),
                     float(row.get('净利润率', 0)),
                     float(row.get('资产周转率', 0)),
-                    float(row.get('权益乘数', 1.5)), 
+                    float(row.get('权益乘数', 1.5)),
                     float(row.get('经营现金流', 0)),
                     str(row.get('核心痛点', '行业竞争加剧')).strip()
                 ))
@@ -230,7 +259,7 @@ def import_financial_excel():
         ]
         for item in fallback_data:
             cursor.execute("""
-                INSERT OR REPLACE INTO company_financial 
+                INSERT OR REPLACE INTO company_financial
                 (company_name, industry, year, roe, margin, turnover, multiplier, cashflow, pain_point)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, item)
@@ -248,7 +277,7 @@ df_company_mapping = pd.DataFrame()
 
 def load_industry_data():
     global df_industry_hierarchy, df_company_mapping
-    
+
     hierarchy_path = "knowledge/industry/SwClassCode_2021.xls"
     if os.path.exists(hierarchy_path):
         try:
@@ -307,14 +336,14 @@ def auto_align_industry(company_name="", query_industry=""):
         conn.close()
         if row and row[0] != "未分类" and row[0].strip() != "":
             return row[0]
-            
+
         sw_info = get_company_industry(company_name)
         if sw_info:
             for keyword, target_ind in core_mapping.items():
                 if keyword in sw_info["一级"] or keyword in sw_info["三级"] or keyword in sw_info["二级"]:
                     return target_ind
             return sw_info["三级"] # 没匹配到核心5个，直接以申万三级作为新行业
-            
+
     # 2. 对输入的模糊行业词进行对齐
     if query_industry and query_industry.strip() != "":
         for keyword, target_ind in core_mapping.items():
@@ -377,6 +406,8 @@ def _run_with_timeout(fn, seconds):
 def load_embedding_model():
     """加载向量模型：本地 models/ 目录（离线）→ 云端下载（小模型优先）。
     成功结果缓存；失败不缓存，下次自动重试。"""
+    if not _ensure_rag_dependencies():
+        return None
     # 1) 本地模型目录（最优先，无需联网）
     for local_dir in LOCAL_MODEL_DIRS:
         if os.path.isdir(local_dir):
@@ -423,6 +454,8 @@ def get_vector_db_and_model():
     注意：本函数可能在后台线程执行，不能使用 st.spinner 等 UI 操作。
     """
     try:
+        if not _ensure_rag_dependencies():
+            return None, None
         model = load_embedding_model()
         if model is None:
             return None, None
@@ -494,6 +527,8 @@ _RAG_STATE = {"model": None, "collection": None, "status": "init", "note": ""}
 
 def _try_local_rag():
     """尝试用本地模型同步初始化 RAG（快，不下载）。成功返回 (model, coll)。"""
+    if not _ensure_rag_dependencies():
+        return None, None
     for local_dir in LOCAL_MODEL_DIRS:
         if os.path.isdir(local_dir):
             try:
@@ -541,10 +576,23 @@ def _sync_rag_state():
         collection = _RAG_STATE["collection"]
 
 
-# 模块加载：本地模型同步初始化；否则立即降级并启动后台下载
-embedding_model, collection = _try_local_rag()
+# 模块加载：默认不阻塞首屏加载本地模型。设置 SAS_SYNC_RAG=1 才同步初始化，
+# 这样 Streamlit Cloud 首次唤醒可以先展示页面，语义模型随后在后台就绪。
+_sync_rag_on_start = os.getenv("SAS_SYNC_RAG", "0") == "1"
+embedding_model, collection = _try_local_rag() if _sync_rag_on_start else (None, None)
+_RAG_THREAD_STARTED = False
 if embedding_model is None:
     embedding_model, collection = None, None
+    _RAG_STATE["status"] = "idle"
+    _RAG_STATE["note"] = "按需后台加载，当前使用关键词检索"
+
+
+def _start_rag_background():
+    """Only start the heavyweight semantic worker when the AI page is used."""
+    global _RAG_THREAD_STARTED
+    if _RAG_THREAD_STARTED or embedding_model is not None:
+        return
+    _RAG_THREAD_STARTED = True
     _RAG_STATE["status"] = "downloading"
     _RAG_STATE["note"] = "语义模型下载中（首次约 1~2 分钟），当前使用关键词检索"
     try:
@@ -616,36 +664,46 @@ def calculate_dcf(free_cash_flow, growth_rate, wacc, terminal_growth_rate=0.02, 
         r = float(wacc)
         tg = float(terminal_growth_rate)
         y = int(years)
-        
-        if r <= tg:
+
+        if y < 1 or y > 20:
+            return json.dumps({"error": "预测年限必须在 1-20 年之间。"}, ensure_ascii=False)
+        if g <= -1:
+            return json.dumps({"error": "预测期增长率必须大于 -100%。"}, ensure_ascii=False)
+        if r <= 0 or r <= tg:
             return json.dumps({"error": "WACC必须大于永续增长率以实现收敛。"}, ensure_ascii=False)
-            
+
         fcfs = []
         discounted_fcfs = []
         current_fcf = fcf
-        
+
         for t in range(1, y + 1):
             current_fcf = current_fcf * (1 + g)
             fcfs.append(current_fcf)
             discount_factor = (1 + r) ** t
             discounted_fcfs.append(current_fcf / discount_factor)
-            
+
         pv_forecast = sum(discounted_fcfs)
         terminal_value = (fcfs[-1] * (1 + tg)) / (r - tg)
         pv_terminal = terminal_value / ((1 + r) ** y)
         enterprise_value = pv_forecast + pv_terminal
-        
+
         st.session_state['tool_traces'].append({
             "agent": "Valuation Agent",
             "tool": "calculate_dcf",
             "input": f"fcf={fcf}, growth={g}, wacc={r}",
             "output": f"折现计算完成，内在价值: {enterprise_value:.2f}万元"
         })
-        
+
         result = {
             "估值模型": "两阶段折现现金流(DCF)模型",
             "WACC": f"{r*100:.2f}%",
             "高速预测期增长率": f"{g*100:.2f}%",
+            "预测年限": y,
+            "预测期现金流": [round(v, 2) for v in fcfs],
+            "预测期现金流现值": round(pv_forecast, 2),
+            "终值": round(terminal_value, 2),
+            "终值现值": round(pv_terminal, 2),
+            "终值占企业价值": f"{(pv_terminal / enterprise_value * 100):.1f}%" if enterprise_value else "—",
             "内在企业价值": f"{enterprise_value:.2f}万元"
         }
         return json.dumps(result, ensure_ascii=False)
@@ -775,7 +833,7 @@ def get_locked_data(query_text):
         cursor.execute("SELECT * FROM industry_benchmark")
         rows = cursor.fetchall()
         conn.close()
-        
+
         for row in rows:
             if row[0][:2] in query_text or query_text in row[0]:
                 return {
@@ -823,13 +881,13 @@ def get_company_data(company_name):
         conn = sqlite3.connect("financial_research.db")
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT company_name, industry, year, roe, margin, turnover, multiplier, cashflow, pain_point 
-            FROM company_financial 
+            SELECT company_name, industry, year, roe, margin, turnover, multiplier, cashflow, pain_point
+            FROM company_financial
             WHERE company_name LIKE ?
         """, (f"%{company_name}%",))
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
             return {
                 "name": row[0],
@@ -1040,13 +1098,16 @@ def compute_risk_radar(company_data=None, db_data=None):
     """
     db = db_data or {}
     comp = company_data or {}
+    _db_source = str(db.get("data_source", "") or "")
+    _db_verified = bool(db.get("data_as_of")) and "估算" not in _db_source and "兜底" not in _db_source
+    _basis_label = "报告期数据已载入" if _db_verified else "本地缓存/默认估算，待核验"
     margins = []
     dims = []
 
     # 1) 偿债与财务杠杆风险：权益乘数越高 → 杠杆风险越高（乘数1→0，乘数6+→5）
     mult = comp.get("multiplier") or db.get("equity_multiplier") or 1.5
     v1 = _clamp((float(mult) - 1.0) / 1.2)
-    margins.append("权益乘数 %.2f → 每超出1倍加 0.83 分（区间映射），乘数为公司/行业真实值" % float(mult))
+    margins.append("权益乘数 %.2f → 每超出1倍加 0.83 分（区间映射），数值来源与报告期见数据口径" % float(mult))
     dims.append("偿债与财务杠杆风险")
 
     # 2) 短期流动性紧缺风险：每股经营现金流/每股收益（现金流质量），<0.5 高风险
@@ -1068,7 +1129,7 @@ def compute_risk_radar(company_data=None, db_data=None):
     if comp_gm > 0 and ind_gm > 0:
         gap = ind_gm - comp_gm
         v3 = _clamp(gap / 8.0)
-        margins.append("毛利率缺口(行业%.1f%%-公司%.1f%%)÷8 → 缺口越大减值风险越高" % (ind_gm, comp_gm))
+        margins.append("毛利率缺口(行业%.1f%%-公司%.1f%%)÷8 → 缺口越大减值风险越高（来源与报告期见数据口径）" % (ind_gm, comp_gm))
     else:
         v3 = _clamp((30.0 - ind_gm) / 8.0) if ind_gm > 0 else 3.0
         margins.append("行业毛利率 %.1f%% → (30-毛利率)/8 估算（口径：行业均值）" % ind_gm)
@@ -1079,7 +1140,7 @@ def compute_risk_radar(company_data=None, db_data=None):
     ind_roe = float(db.get("avg_roe") or 0)
     if comp_roe > 0 and ind_roe > 0:
         v4 = _clamp((ind_roe - comp_roe) / 5.0)
-        margins.append("ROE差距(行业%.1f%%-公司%.1f%%)÷5 → 落后越多风险越高" % (ind_roe, comp_roe))
+        margins.append("ROE差距(行业%.1f%%-公司%.1f%%)÷5 → 落后越多风险越高（来源与报告期见数据口径）" % (ind_roe, comp_roe))
     else:
         v4 = _clamp((10.0 - ind_roe) / 4.0) if ind_roe > 0 else 3.0
         margins.append("行业平均ROE %.1f%% → (10-ROE)/4 估算（口径：行业均值）" % ind_roe)
@@ -1099,7 +1160,7 @@ def compute_risk_radar(company_data=None, db_data=None):
         "dimensions": dims,
         "values": [v1, v2, v3, v4, v5],
         "methodology": margins,
-        "based_on": "真实财务指标映射（权益乘数/现金流质量/毛利率/ROE/行业政策基准）",
+        "based_on": f"{_basis_label}；权益乘数/现金流质量/毛利率/ROE/行业政策基准（政策值需按行业资料核验）",
     }
 
 
@@ -1259,7 +1320,7 @@ def extract_report_data(raw_report):
         try:
             parts = raw_report.split("```json")
             json_str = parts[1].split("```")[0].strip()
-            dynamic_data = json.loads(json_str)
+            dynamic_data = sanitize_json(json.loads(json_str))
             clean_text = parts[0].strip() + "\n" + parts[1].split("```")[1].strip()
         except Exception:
             pass
@@ -1275,20 +1336,34 @@ def chart_pdf_bytes(fig):
         return None
 
 
+def render_plotly_chart(fig, **kwargs):
+    """统一渲染 Plotly 图表，避免坏值或版本差异阻断整页。"""
+    try:
+        apply_plotly_theme(fig)
+        kwargs.setdefault("config", PLOTLY_CONFIG)
+        return st.plotly_chart(fig, **kwargs)
+    except Exception as exc:
+        # Keep the report usable when a single optional chart contains an
+        # unsupported value.  The underlying data remains visible in the
+        # report/export sections.
+        st.warning(f"图表渲染已跳过（数据仍保留）：{str(exc)[:120]}")
+        return None
+
+
 def get_rag_context(query_text, top_k=2):
     """
     RAG 本地知识库检索系统：自动解析 PDF 或 TXT
     """
     context_chunks = []
     knowledge_dir = "knowledge"
-    
+
     if not os.path.exists(knowledge_dir):
         os.makedirs(knowledge_dir)
         with open(os.path.join(knowledge_dir, "policy_and_risk_standard.txt"), "w", encoding="utf-8") as f:
             f.write("新能源汽车支持政策：落实15%高新技术企业所得税优惠，地方绿色金融提供专项低息贴息贷款。\n")
             f.write("新能源汽车行业风险：重点审计应收账款周转放缓，防范因国家补贴退坡导致的资产减值及坏账拨备风险。\n")
             f.write("白酒行业监管风险：注意税收政策调整红线、食品安全合规红线，防范存货减值和三公消费限制。\n")
-            
+
     if not os.path.exists(knowledge_dir):
         return "本地 RAG 知识库未装载。"
 
@@ -1304,7 +1379,7 @@ def get_rag_context(query_text, top_k=2):
                 elif filename.endswith((".txt", ".md")):
                     with open(filepath, "r", encoding="utf-8") as f:
                         text_content = f.read()
-                
+
                 if text_content:
                     chunks = [c.strip() for c in text_content.replace("。", "。\n").split("\n") if len(c.strip()) > 15]
                     keywords = [word for word in query_text if len(word) >= 1]
@@ -1314,13 +1389,13 @@ def get_rag_context(query_text, top_k=2):
                             context_chunks.append((match_score, chunk, filename))
             except Exception as e:
                 print(f"RAG 解析 {filename} 失败: {e}")
-            
+
     context_chunks.sort(key=lambda x: x[0], reverse=True)
     results = context_chunks[:top_k]
-    
+
     if not results:
         return "本地 RAG 知识库暂无直接关联的底稿或法规数据。"
-        
+
     formatted_context = "\n".join([f"📖 [RAG底稿来源: {r[2]}] {r[1]}" for r in results])
     return formatted_context
 
@@ -1409,11 +1484,11 @@ def method_domain_for(research_type, purpose, report_type):
 # --- 4. 界面美化 ---
 st.markdown("""
     <style>
-    .report-container { 
-        border: 1px solid #e2e8f0; 
-        padding: 30px; 
-        border-radius: 8px; 
-        background-color: #f8fafc; 
+    .report-container {
+        border: 1px solid #e2e8f0;
+        padding: 30px;
+        border-radius: 8px;
+        background-color: #f8fafc;
         line-height: 1.8;
         color: #1e293b;
     }
@@ -1435,7 +1510,24 @@ if 'current_data' not in st.session_state: st.session_state['current_data'] = {}
 # --- 产品化功能状态初始化（示例引导 / 上传 / 收藏 / 使用看板） ---
 pf.init_product_state()
 
-# --- 6. 侧边栏 ---
+# --- 6. 工作台页面切换 ---
+_workbench_pages = ["AI 研究报告", "交易材料与估值", "可比公司分析", "DCF 情景模型", "财报更新", "产业链地图"]
+workbench_page = st.radio("工作台页面", _workbench_pages, horizontal=True, key="workbench_page")
+if workbench_page != "AI 研究报告":
+    fw.render_workbench(
+        st,
+        workbench_page,
+        chain_builder=icd.build_chain_payload,
+        news_fetcher=nf,
+        webpage_reader=wr.read_webpage,
+    )
+    st.stop()
+if not api_available:
+    st.error("AI 研究报告页面需要配置 DEEPSEEK_API_KEY；请切换到其他工作台页面，或在 Streamlit Secrets 中配置密钥。")
+    st.stop()
+_start_rag_background()
+
+# --- 7. 传统 AI 研究页面侧边栏 ---
 with st.sidebar:
     # 上传年报 / 财务数据表（可选）
     with st.expander("📤 上传年报 / 财务数据表（可选）"):
@@ -1466,7 +1558,20 @@ with st.sidebar:
         _meta = du.read_meta()
         if _meta.get("report_period"):
             st.caption(f"行业基准数据：**{_meta.get('industries', 0)} 个行业** · 全市场 **{_meta.get('companies_total', 0)} 家** 公司")
-            st.caption(f"报告期：**{_meta['report_period']}**（业绩报表真实聚合）· 最近刷新 {_meta.get('updated_at', '')}")
+            _source_status = str(_meta.get("source_status") or "unknown_legacy")
+            _quality_label = "实时接口成功" if _source_status == "live_api" else "历史缓存或来源状态缺失，不能视为最新事实"
+            st.caption(f"报告期：**{_meta['report_period']}**（{_quality_label}）· 最近刷新 {_meta.get('updated_at', '')}")
+            if _source_status != "live_api":
+                st.warning(f"数据源状态：{_source_status}；{_meta.get('data_quality', '请刷新或上传经核验资料')}")
+            try:
+                _last_refresh = _dt.datetime.fromisoformat(str(_meta.get("last_refresh", "")))
+                _age_hours = (_dt.datetime.now() - _last_refresh).total_seconds() / 3600.0
+                if _age_hours > 24:
+                    st.warning(f"本地底表距最近刷新约 {_age_hours:.1f} 小时，属于陈旧快照；请刷新或上传更新后的报告。")
+                elif _age_hours > 6:
+                    st.info(f"本地底表距最近刷新约 {_age_hours:.1f} 小时，超过 6 小时缓存窗口。")
+            except Exception:
+                st.caption("刷新时间无法解析，数据新鲜度待核验。")
         else:
             st.caption("尚未完成全市场数据同步，点击下方按钮触发（约 1-2 分钟）。")
         if st.button("🔄 刷新实时财务数据", key="btn_refresh_data", use_container_width=True):
@@ -1477,7 +1582,8 @@ with st.sidebar:
             else:
                 st.warning("刷新失败（数据源可能暂时不可达），已保留本地数据。")
             st.rerun()
-        st.caption("说明：实时行情接口受数据源限制不可达；行业财务指标来自东方财富业绩报表全市场聚合，自动按 6 小时缓存。")
+        _freshness_note = "实时接口成功" if _meta.get("source_status") == "live_api" else "当前为历史缓存或来源状态缺失快照"
+        st.caption(f"说明：实时行情接口受数据源限制不可达；行业财务指标{_freshness_note}，自动按 6 小时缓存。")
 
     # --- 🧠 系统方法论知识库（仅内部学习调用，不对访客开放浏览） ---
     with st.expander("🧠 系统方法论知识库（内部）", expanded=False):
@@ -1501,7 +1607,7 @@ with st.sidebar:
             st.session_state['current_report'] = h['content']
             st.session_state['current_data'] = h['data']
             st.session_state['current_query'] = h['query']
-            st.rerun()            
+            st.rerun()
     st.divider()
     # 收藏列表（产品化：用户留存）
     st.markdown("### ⭐ 我的收藏")
@@ -1522,13 +1628,13 @@ with st.sidebar:
     else:
         st.caption("暂无收藏。生成报告后点击「收藏本报告」即可在这里管理。")
     st.title("🛠 启动投研")
-    
+
     research_mode = st.radio(
         "选择分析模式",
         ["简易模式（快速分析）", "标准模式（专业投研）"],
         key="research_mode"
     )
-    
+
     company_query = ""
     query = ""
     period = "默认近三年+最新季度"
@@ -1564,10 +1670,10 @@ with st.sidebar:
             else:
                 month_select = st.selectbox("⚙️ 选择月份", ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"], key="month_select")
                 period = f"{year_select}年{month_select}"
-                
+
         report_type = st.selectbox("报告类型", ["年度策略", "季度跟踪", "专题研究"], key="report_type")
         purpose = st.selectbox("研究目的", ["投资价值分析", "行业趋势分析", "财务质量分析", "风险评估"], key="purpose")
-    
+
     submit_btn = st.button("🚀 开启 7-Agent 深度协同", key="submit_btn")
     st.caption("提示：结合本地离线数据仓库及 RAG，无需网络请求，零崩溃风险，需要约1~2分钟。:D")
 
@@ -1681,22 +1787,22 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         log_callback(f"🧠 [Method Bank] 系统方法库已检索调用 {len(_method_used)} 份学习资料：{'、'.join(_method_used[:6])}")
     else:
         log_callback("🧠 [Method Bank] 系统方法库暂无匹配该任务的资料（可上传补充）。")
-    
+
     # 重新加载 Data Retrieval Agent 避免白酒行业污染
     research_requirement = query_understanding_agent(aligned_industry, company_name, period, purpose, report_type)
     log_callback(f"🧠 [Query Agent] 对齐行业分类 -> {aligned_industry}，需求解析: {research_requirement}")
-    
+
     company_data = None
     if company_name:
         company_data = get_company_data(company_name)
-    
+
     # 杜邦分析与DCF估值复合提示词 (Financial Agent)
     if company_data:
         log_callback(f"🔑 [Database] 检测到个股【{company_name}】。开始进行杜邦基准与DCF分析锁定。")
         financial_prompt = f"""
         请针对标的公司【{company_name}】与【{db_data['industry_name']}】行业均值进行深度杜邦分解对标审计。
         本篇研报的分析周期确定为【{period}】，研究目的偏向于【{purpose}】。
-        
+
         【{company_name} 财务指标】：
         - ROE: {company_data['roe']}%
         - 净利润率: {company_data['margin']}%
@@ -1704,13 +1810,13 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         - 权益乘数: {company_data['multiplier']}
         - 经营现金流: {company_data['cash']}万元
         - 核心痛点: '{company_data['pain_point']}'
-        
+
         【{db_data['industry_name']} 行业均值】：
         - ROE: {db_data['avg_roe']}%
         - 净利润率: {db_data['net_profit_margin']}%
         - 资产周转率: {db_data['asset_turnover']}
         - 权益乘数: {db_data['equity_multiplier']}
-        
+
         请进行深度审计并调用对应工具：
         1. 必须调用 `calculate_dcf` 工具对该个股进行内在价值估算。你可以使用公司的当前经营现金流 {company_data['cash']} 万元作为 free_cash_flow。假设增长率为 0.12 (12%)，WACC折现率为 0.085 (8.5%)。
         2. 针对其研究目的【{purpose}】，利用杜邦三要素进行拆解，指出其财务偏离行业基准的主要驱动力量。
@@ -1729,7 +1835,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         净利润率: {db_data['net_profit_margin']}%
         资产周转率: {db_data['asset_turnover']}
         权益乘数: {db_data['equity_multiplier']}
-        
+
         分析周期为【{period}】，研究偏好为【{purpose}】。
         请分析该行业在【{period}】内的杜邦三要素驱动机制，尤其是其【{purpose}】维度下的财务质量表现。
         """
@@ -1747,13 +1853,13 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     if _uploaded_text:
         rag_context = rag_context + "\n\n[用户上传年报文本]\n" + _uploaded_text[:5000]
     log_callback("✅ [RAG Engine] 本地向量数据库检索对齐完成！")
-    
+
     # 1. Planner Agent
     _set_progress(22, "📋 Planner Agent：制定研究提纲")
     status_callback("Planner", "running")
     log_callback("🔄 [Planner Agent] 正在制定财报质量及行业深度分析提纲...")
     time.sleep(1)
-    
+
     # 2. Research Agent（支持实时新闻/网页图表工具）
     _set_progress(30, "🔍 Research Agent：行业竞争格局与 CR4 分析")
     status_callback("Research", "running")
@@ -1786,7 +1892,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         ).choices[0].message.content
     else:
         res_research = _res_msg.content
-    
+
     # 3. Financial Agent (支持 DCF 工具调用)
     _set_progress(42, "📊 Financial Agent：杜邦分解 + DCF 估值")
     status_callback("Financial", "running")
@@ -1847,12 +1953,12 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         messages=[{"role": "user", "content": risk_prompt}],
         temperature=0.3
     ).choices[0].message.content
-   
+
     # 🌟 核心修复二：学术级智能体多边辩论机制 (Financial Agent vs Risk Agent) 🌟
     _set_progress(68, "💬 多空辩论：Financial 专家 vs Risk 审计专家")
     log_callback("💬 [Debate] 审计对立碰撞启动：Financial 专家 与 Risk 审计专家辩论会...")
     time.sleep(1)
-    
+
     debate_prompt_fin = f"""
     针对 {aligned_industry} 行业的财务前景及核心公司，基于你的研究支持：{res_financial}。
     请作为绝对乐观的财务学家，提出论证，重点证明该行业的杜邦收益质量以及其估值具备极高的内在安全边际，反驳任何盲目的减值质疑。
@@ -1863,13 +1969,13 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         temperature=0.5
     ).choices[0].message.content
     log_callback(f"💬 [Financial Agent]: 观点成立。杜邦分析显示资产效率极高，DCF内在企业价值空间充足。")
-    
+
     debate_prompt_risk = f"""
     现在请扮演极具批判性的风险审计总监。
-    
+
     刚才财务专家发表了如下乐观论点：
     {res_debate_fin}
-    
+
     请根据风险底稿【{res_risk}】和公司的痛点，提出尖锐的反驳。重点论证其高周转、高ROE是否是通过透支现金流、增加隐性杠杆获得的，证明其真实的‘核心利润质量’并不像账面数据那么好看。
     """
     res_debate_risk = client.chat.completions.create(
@@ -1884,20 +1990,20 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     status_callback("Judge", "running")
     log_callback("⚖️ [Committee Agent] 专家委员会正在进行矛盾消除、逻辑排歧与可信等级审定...")
     judge_reference = get_judge_reference(db_data["industry_name"])
-    
+
     committee_prompt = f"""
     你现在是【专家委员会 Committee Agent】。
     你的任务是根据多边辩论、数据规划，以及数据库对报告中的每一条结论进行真实性验证、逻辑排歧，并为核心论据标明“可信度等级(A/B/C)”。
-    
+
     ======== 辩论听证会记录 ========
     1. 财务专家立场：{res_debate_fin}
     2. 风险专家反驳：{res_debate_risk}
-    
+
     ======== 数据库对照底牌 ========
     行业基准：行业={db_data["industry_name"]}, ROE={db_data["avg_roe"]}%, 净利率={db_data["net_profit_margin"]}%
     政策背景：{judge_reference["policy"]}
     风险事实：{judge_reference["risk"]}
-    
+
     请严格执行以下三步：
     1. 【矛盾消除与逻辑一致性】：分析财务乐观论调与风险审计的反驳是否冲突。如果存在冲突（例如高ROE与低现金流），指出原因并调和逻辑，给出最终审定意见。
     2. 【数据来源与可信度度量】：
@@ -1908,7 +2014,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
        - 页面/位置: [例如 P23 利润表 或 数据库底表第一行]
        - 可信等级: [A/B/C 三选一]
     3. 最终判定：是否通过终审。
-    
+
     必须返回标准 JSON 字符串：
     {{
         "score": 98,
@@ -1922,7 +2028,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
         "reason": "辩论逻辑已调和并交叉验证通过，逻辑无瑕疵"
     }}
     """
-    
+
     res_verifier = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role":"user", "content":committee_prompt}],
@@ -2015,6 +2121,11 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
                                  is_company_mode=is_company)
     report_meta = build_report_meta(db_data, company_data, is_company)
     as_of = db_data.get("data_as_of") or "本地库"
+    _db_source_text = str(db_data.get("data_source", "") or "")
+    _db_is_verified = bool(db_data.get("data_as_of")) and "估算" not in _db_source_text and "兜底" not in _db_source_text
+    _db_quality_note = ("行业财务指标来自东方财富业绩报表全市场聚合，报告期见数据截止标注"
+                        if _db_is_verified else
+                        "行业财务指标为本地历史缓存或默认估算，不能视为已核验最新事实")
     if company_data:
         chart_data = {
             "company_name": company_name,
@@ -2038,9 +2149,10 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
             "data_gaps": data_gaps,
             "report_meta": report_meta,
             "market_as_of": as_of,
-            "data_note": "行业毛利/ROE/CR4/净利率为东方财富业绩报表全市场真实聚合；历史序列与市场规模为示意/估算口径，详见缺口说明。",
+            "data_note": f"{_db_quality_note}；历史序列与市场规模为示意/估算口径，详见缺口说明。",
             "news_items": news_items,
             "news_note": _news_bundle.get("note", ""),
+            "news_source_status": _news_bundle.get("source_status", []),
             "leader_data": leader_payload,
             "web_page_summary": web_page_summary,
         }
@@ -2055,7 +2167,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
                 "years": ["2022", "2023", "2024", "2025", "2026(E)"],
                 "market_size": [int(base_size * f) for f in [0.8, 0.92, 1.0, 1.08, 1.15]],
                 "growth_rate": [15.0, 13.5, 10.2, 8.5, 7.8],
-                "note": "市场规模/增速为估算口径；CR4、ROE、净利率、毛利率为真实聚合值"
+                "note": f"市场规模/增速为估算口径；{_db_quality_note}"
             },
             "financial_trend": {
                 "years": ["2022", "2023", "2024", "2025", "2026Q2"],
@@ -2073,11 +2185,12 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
             "data_gaps": data_gaps,
             "report_meta": report_meta,
             "market_as_of": as_of,
-            "data_note": "CR4/ROE/净利率/毛利率为真实全市场聚合；历史趋势与市场规模为估算口径，详见缺口说明。",
+            "data_note": f"{_db_quality_note}；历史趋势与市场规模为估算口径，详见缺口说明。",
             "evidence_ledger": evidence_ledger,
             "locked_source": db_data["data_source"],
             "news_items": news_items,
             "news_note": _news_bundle.get("note", ""),
+            "news_source_status": _news_bundle.get("source_status", []),
             "leader_data": leader_payload,
             "web_page_summary": web_page_summary,
         }
@@ -2099,7 +2212,7 @@ with col_logs:
     if 'logs_history' not in st.session_state: st.session_state['logs_history'] = []
     logs_html = "".join([f"<p style='font-size: 11px; color: #475569;'>⏱️ {log_msg}</p>" for log_msg in st.session_state['logs_history']])
     log_area.markdown(f"<div style='border: 1px solid #cbd5e1; padding: 10px; border-radius: 6px; background-color: #f1f5f9; height: 500px; overflow-y: auto;'>{logs_html}</div>", unsafe_allow_html=True)
-    
+
     # 插入移动过来的智能体决策流面板
     st.divider()
     st.markdown("### 智能体决策流")
@@ -2250,7 +2363,7 @@ with col_main:
         st.session_state['logs_history'] = []
         st.session_state['tool_traces'] = [] # 清空之前的工具调用链痕迹
         st.session_state['agent_times'] = []  # 清空上一轮的 Agent 耗时
-        
+
         try:
             raw_report = run_research_flow(
                 query,
@@ -2272,14 +2385,14 @@ with col_main:
         clean_text, dynamic_data = extract_report_data(raw_report)
         if not clean_text or not clean_text.strip():
             clean_text = "⚠️ 本次研究未能生成报告正文（模型返回为空）。请检查 DeepSeek API 额度是否充足，或稍后重试。"
-        
+
         st.session_state['current_report'] = clean_text
         st.session_state['current_data'] = dynamic_data
         # 历史记录里显示标的公司或行业名
         st.session_state['current_query'] = company_query if company_query else query
         st.session_state['history'].insert(0, {
-            "query": st.session_state['current_query'], 
-            "content": clean_text, 
+            "query": st.session_state['current_query'],
+            "content": clean_text,
             "data": dynamic_data
         })
         # 记录本次运行的使用数据（时长 / token / Agent 耗时）
@@ -2291,7 +2404,7 @@ with col_main:
             _tok_after.get("output_tokens", 0) - _tok_before.get("output_tokens", 0),
             st.session_state.get("agent_times", []),
         )
-        
+
         for agent in ["Planner", "Research", "Financial", "Policy", "Risk", "Judge", "Report"]:
             st.session_state[f"status_{agent}"] = "success"
         st.rerun()
@@ -2302,38 +2415,38 @@ with col_main:
         _lock = st.session_state.get('current_data', {}).get('locked_source', '')
         if _asof or _lock:
             st.caption(f"📅 数据截至报告期：**{_asof or '本地库'}**　|　🔗 数据来源：{_lock}")
-        
+
         # A. 动态数据看板展示 (双模式适配)
         data = st.session_state['current_data']
         is_company_mode = "company_name" in data
-        
+
         with st.container():
             st.markdown('<div class="chart-box">', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
-            
+
             with c1:
                 if is_company_mode:
                     fig_comp = go.Figure(data=[
                         go.Bar(
-                            name=data["company_name"], 
-                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'], 
+                            name=data["company_name"],
+                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'],
                             y=[data["company_roe"], data["company_margin"], data["company_turnover"]*100, data["company_multiplier"]*10],
                             marker_color='#1e3a8a'
                         ),
                         go.Bar(
-                            name='行业均值基准', 
-                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'], 
+                            name='行业均值基准',
+                            x=['ROE (%)', '净利润率 (%)', '资产周转率 (x100)', '权益乘数 (x10)'],
                             y=[data["industry_roe"], data["industry_margin"], data["industry_turnover"]*100, data["industry_multiplier"]*10],
                             marker_color='#ef4444'
                         )
                     ])
                     fig_comp.update_layout(
-                        title=f"{data['company_name']} 与行业杜邦因子对比 (标准化)", 
+                        title=f"{data['company_name']} 与行业杜邦因子对比 (标准化)",
                         barmode='group', height=300, margin=dict(l=10, r=10, t=40, b=10)
                     )
-                    st.plotly_chart(fig_comp, use_container_width=True, key="company_dupont_chart")
-                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）· 东方财富业绩报表")
-                    
+                    render_plotly_chart(fig_comp, use_container_width=True, key="company_dupont_chart")
+                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）；{data.get('data_note', '来源待核实')}")
+
                     _comp_pdf = chart_pdf_bytes(fig_comp)
                     if _comp_pdf is not None:
                         st.download_button(
@@ -2347,9 +2460,9 @@ with col_main:
                     share_data = data.get("market_share", {"labels": ["集中度 (CR4)", "其他企业"], "values": [55, 45]})
                     fig_pie = go.Figure(data=[go.Pie(labels=share_data["labels"], values=share_data["values"], hole=.4)])
                     fig_pie.update_layout(title="市场集中度 (CR4) 动态格局", height=300, margin=dict(l=10, r=10, t=40, b=10))
-                    st.plotly_chart(fig_pie, use_container_width=True, key="industry_pie_chart")
-                    st.caption(f"📚 数据来源：东方财富业绩报表全市场聚合（报告期 {data.get('market_as_of', '—')}）· CR4={share_data['values'][0]}%")
-                    
+                    render_plotly_chart(fig_pie, use_container_width=True, key="industry_pie_chart")
+                    st.caption(f"📚 数据来源：{data.get('data_note', '行业指标来源待核实')}；CR4={share_data['values'][0]}%")
+
                     _pie_pdf = chart_pdf_bytes(fig_pie)
                     if _pie_pdf is not None:
                         st.download_button(
@@ -2359,7 +2472,7 @@ with col_main:
                         mime="application/pdf",
                         key="dl_pie"
                     )
-                
+
             with c2:
                 if is_company_mode:
                     fig_radar = go.Figure()
@@ -2377,9 +2490,9 @@ with col_main:
                         polar=dict(radialaxis=dict(visible=True, range=[0, max(50.0, data["company_roe"]*1.5)])),
                         title="标的公司与行业能力多维透视", height=300, margin=dict(l=10, r=10, t=40, b=10)
                     )
-                    st.plotly_chart(fig_radar, use_container_width=True, key="company_radar_chart")
-                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）与行业聚合值（{data.get('market_as_of', '')}）")
-                    
+                    render_plotly_chart(fig_radar, use_container_width=True, key="company_radar_chart")
+                    st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）与行业聚合值（{data.get('market_as_of', '')}）；{data.get('data_note', '来源待核实')}")
+
                     _radar_pdf = chart_pdf_bytes(fig_radar)
                     if _radar_pdf is not None:
                         st.download_button(
@@ -2394,10 +2507,11 @@ with col_main:
                     fig_growth = go.Figure()
                     fig_growth.add_trace(go.Bar(x=growth_data["years"], y=growth_data["market_size"], name="市场规模 (亿元)", yaxis="y1", marker_color="#1e3a8a"))
                     fig_growth.add_trace(go.Scatter(x=growth_data["years"], y=growth_data["growth_rate"], name="增速 (%)", yaxis="y2", mode="lines+markers", line=dict(color="#ef4444", width=3)))
-                    fig_growth.update_layout(title="行业市场规模与复合增速图", height=300, yaxis=dict(title="市场规模 (亿元)", side="left"), yaxis2=dict(title="增速 (%)", side="right", overlaying="y", showgrid=False))
-                    st.plotly_chart(fig_growth, use_container_width=True, key="industry_growth_chart")
-                    st.caption("📚 数据来源：市场规模/增速为估算口径（公开区间）；CR4/ROE/净利率/毛利率为东方财富业绩报表真实聚合")
-                    
+                    _growth_mark = "（含估算/趋势示意）" if ("估算" in str(data.get("data_note", "")) or "示意" in str(data.get("data_note", ""))) else ""
+                    fig_growth.update_layout(title="行业市场规模与复合增速图" + _growth_mark, height=300, yaxis=dict(title="市场规模 (亿元)", side="left"), yaxis2=dict(title="增速 (%)", side="right", overlaying="y", showgrid=False))
+                    render_plotly_chart(fig_growth, use_container_width=True, key="industry_growth_chart")
+                    st.caption(f"📚 数据来源：市场规模/增速为估算口径（公开区间）；{data.get('data_note', '行业指标来源待核实')}")
+
                     _growth_pdf = chart_pdf_bytes(fig_growth)
                     if _growth_pdf is not None:
                         st.download_button(label="📈 导出市场规模增速图为 PDF", data=_growth_pdf, file_name="market_growth_chart.pdf", mime="application/pdf", key="dl_growth")
@@ -2435,8 +2549,8 @@ with col_main:
                     height=300, margin=dict(l=10, r=10, t=50, b=10),
                     yaxis_title="ROE 贡献（百分点/对数）",
                 )
-                st.plotly_chart(_wf_fig, use_container_width=True, key="dupont_waterfall_chart")
-                st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）；分解口径：ln 差线性化示意")
+                render_plotly_chart(_wf_fig, use_container_width=True, key="dupont_waterfall_chart")
+                st.caption(f"📚 数据来源：公司财务指标（{data.get('company_name','')}）vs 行业聚合值（{data.get('market_as_of', '')}）；{data.get('data_note', '来源待核实')}；分解口径：ln 差线性化示意")
 
             # --- 🌟 新增：多智能体工具与数据库自研 Trace 监控组件 🌟 ---
             if st.session_state['tool_traces']:
@@ -2454,7 +2568,7 @@ with col_main:
                         cols[1].markdown(f"📂 `{trace['tool']}`")
                         cols[2].code(trace['input'], language="json")
                         cols[3].info(trace['output'])
-                        
+
             # --- 🌟 新增：专家委员会学术级数据证据链可视化面板 (Evidence Ledger) 🌟 ---
             evidence_data = data.get("evidence_ledger", [])
             if evidence_data:
@@ -2485,28 +2599,29 @@ with col_main:
                 trend_data = data.get("financial_trend", {"years": ["2022", "2023", "2024", "2025", "2026Q2"], "roe_trend": [12, 11, 10, 9.5, 9.1], "margin_trend": [10, 9.5, 9, 8.8, 8.5]})
                 fig_trend = go.Figure()
                 fig_trend.add_trace(go.Scatter(
-                    x=trend_data["years"], 
-                    y=trend_data["roe_trend"], 
-                    mode='lines+markers', 
-                    name='平均ROE (%)', 
+                    x=trend_data["years"],
+                    y=trend_data["roe_trend"],
+                    mode='lines+markers',
+                    name='平均ROE (%)',
                     line=dict(color='#2563eb', width=3)
                 ))
                 fig_trend.add_trace(go.Scatter(
-                    x=trend_data["years"], 
-                    y=trend_data["margin_trend"], 
-                    mode='lines+markers', 
-                    name='净利润率 (%)', 
+                    x=trend_data["years"],
+                    y=trend_data["margin_trend"],
+                    mode='lines+markers',
+                    name='净利润率 (%)',
                     line=dict(color='#0d9488', width=3)
                 ))
+                _trend_mark = "（含趋势示意）" if ("示意" in str(data.get("data_note", "")) or "趋势" in str(data.get("data_note", ""))) else ""
                 fig_trend.update_layout(
-                    title="主要盈利指标变化趋势 (折线图)",
+                    title="主要盈利指标变化趋势 (折线图)" + _trend_mark,
                     height=300,
                     margin=dict(l=10, r=10, t=40, b=10),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
-                st.plotly_chart(fig_trend, use_container_width=True, key="industry_trend_chart")
-                st.caption("📚 数据来源：最新报告期为东方财富业绩报表真实聚合；历史期为趋势示意（授权数据源缺失）")
-                
+                render_plotly_chart(fig_trend, use_container_width=True, key="industry_trend_chart")
+                st.caption(f"📚 数据来源：{data.get('data_note', '行业指标来源待核实')}；历史期为趋势示意（授权数据源缺失）")
+
                 _trend_pdf = chart_pdf_bytes(fig_trend)
                 if _trend_pdf is not None:
                     st.download_button(
@@ -2516,7 +2631,7 @@ with col_main:
                     mime="application/pdf",
                     key="dl_trend"
                 )
-                
+
             with c4:
                 # 横向条形图：核心财务能力指标对比
                 cap_data = data.get("capability_comparison", {"metrics": ["盈利能力", "流动性", "资产效率", "安全边际"], "values": [12, 15, 60, 20]})
@@ -2531,9 +2646,9 @@ with col_main:
                     height=300,
                     margin=dict(l=10, r=10, t=40, b=10)
                 )
-                st.plotly_chart(fig_cap, use_container_width=True, key="capability_comparison_chart")
-                st.caption("📚 数据来源：ROE/毛利率/CR4/净利率为东方财富业绩报表全市场聚合（报告期见数据截止标注）")
-                
+                render_plotly_chart(fig_cap, use_container_width=True, key="capability_comparison_chart")
+                st.caption(f"📚 数据来源：{data.get('data_note', '行业指标来源待核实')}（报告期见数据截止标注）")
+
                 _cap_pdf = chart_pdf_bytes(fig_cap)
                 if _cap_pdf is not None:
                     st.download_button(
@@ -2560,7 +2675,7 @@ with col_main:
                 }
                 xs = [nd["x"] for nd in nodes]
                 ys = [nd["y"] for nd in nodes]
-                zs = [nd["z"] for nd in nodes]
+                zs = [nd.get("z") if nd.get("z") is not None else 0 for nd in nodes]
                 names = [nd["name"] for nd in nodes]
                 colors = [stage_color_map.get(nd.get("stage", ""), "#2563eb") for nd in nodes]
                 custom = [dict(
@@ -2571,6 +2686,7 @@ with col_main:
                     margin=nd["margin"],
                     features=nd["features"],
                     source=nd["source"],
+                    quality=nd.get("data_quality", "待核实"),
                     news=_chain_news_text,
                 ) for nd in nodes]
                 try:
@@ -2595,7 +2711,7 @@ with col_main:
                             "📈 利润率：%{customdata.margin}<br>"
                             "✨ 特点：%{customdata.features}<br>"
                             "📰 实时动态（网站自动检索）：%{customdata.news}<br>"
-                            "📚 数据来源：%{customdata.source}<extra></extra>"
+                            "📚 数据来源：%{customdata.source}<br>🔎 数据质量：%{customdata.quality}<extra></extra>"
                         ),
                     )])
                     _z_axis = dict(showticklabels=True)
@@ -2626,9 +2742,10 @@ with col_main:
                         ),
                         hoverlabel=dict(font=dict(size=12, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
                     )
-                    st.plotly_chart(fig_3d, use_container_width=True, key="industry_3d_chain_chart")
+                    render_plotly_chart(fig_3d, use_container_width=True, key="industry_3d_chain_chart")
                     st.caption("📐 坐标含义：**X 轴**＝产业链环节推进（上游→下游）｜**Y 轴**＝阶段层级（上游1.5 → 服务-1.5）｜"
-                               "**Z 轴**＝环节利润率中值(%)（由各环节利润率区间解析，真实口径）")
+                               "**Z 轴**＝环节利润率中值(%)。缺失利润率显示为 0，并在数据质量中标注。")
+                    st.caption("📚 数据来源：产业链节点 source 字段（公开资料/用户上传/数据库）；实时动态来自已返回的公开新闻源。")
                 except Exception as _3d_err:
                     # 3D 图渲染容错：极少数 plotly 版本兼容性问题时降级为列表展示，不阻断页面
                     print(f"[3D Chain] 3D 渲染失败，降级为列表展示: {_3d_err}")
@@ -2637,9 +2754,9 @@ with col_main:
                         st.markdown(f"**{_nd.get('name', '')}**（{_nd.get('stage', '')}）")
                         st.caption(f"业务：{_nd.get('business', '')}｜龙头：{_nd.get('leaders', '')}｜利润率：{_nd.get('margin', '')}")
                 if chain.get("matched_industry"):
-                    st.caption(f"已匹配行业：**{chain['matched_industry']}** —— {chain.get('note', '')}")
+                    st.caption(f"已匹配行业：**{chain['matched_industry']}** —— {chain.get('note', '')}；数据质量：{chain.get('data_quality', 'curated')}")
                 else:
-                    st.info(chain.get("note", "通用产业链框架（该行业暂未收录细分库），系统已自动检索实时新闻充实动态。"))
+                    st.info(chain.get("note", "通用产业链框架（该行业暂未收录细分库），系统已自动检索实时新闻充实动态。") + f" 数据质量：{chain.get('data_quality', 'generic')}。")
                 if _chain_news:
                     with st.expander("📰 产业链实时动态（网站自动检索，悬停亦可查看）", expanded=False):
                         for _cn in _chain_news[:8]:
@@ -2683,7 +2800,7 @@ with col_main:
                     margin=dict(l=10, r=10, t=50, b=10),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                st.plotly_chart(_fig_leader, use_container_width=True, key="leader_compare_chart")
+                render_plotly_chart(_fig_leader, use_container_width=True, key="leader_compare_chart")
                 _notes = _leader.get("notes", {})
                 for _c in _comps:
                     st.caption(f"**{_c}**：{_notes.get(_c, '')}")
@@ -2705,6 +2822,9 @@ with col_main:
                 st.markdown('<div class="chart-box">', unsafe_allow_html=True)
                 st.write(f"#### 📰 最新新闻与公告（实时抓取 · {data.get('news_note', '')}）")
                 st.caption("来源：东方财富公告大全 / 全市场公告 / 7×24快讯 / 搜狗新闻 / 财新网（无需付费 API）")
+                if data.get("news_source_status"):
+                    with st.expander("查看各数据源成功状态", expanded=False):
+                        st.dataframe(pd.DataFrame(data.get("news_source_status", [])), use_container_width=True)
                 # 来源分布图
                 _src_counter = {}
                 for _n in _news_list:
@@ -2715,7 +2835,8 @@ with col_main:
                                                        values=list(_src_counter.values()), hole=.45)])
                     _fig_news.update_layout(title="新闻/公告来源分布", height=280,
                                             margin=dict(l=10, r=10, t=50, b=10))
-                    st.plotly_chart(_fig_news, use_container_width=True, key="news_source_chart")
+                    render_plotly_chart(_fig_news, use_container_width=True, key="news_source_chart")
+                    st.caption("📚 数据来源：当前新闻列表的 source 字段；各抓取源成功状态见上方数据源状态表。")
                 # 列表（带链接）
                 _ncols = st.columns(2)
                 for _idx, _n in enumerate(_news_list[:12]):
@@ -2765,7 +2886,8 @@ with col_main:
                 _avgs_show = [round(sum(_agg_times[a]) / len(_agg_times[a]), 2) for a in _names_show]
                 _fig_usage = go.Figure(data=[go.Bar(x=_names_show, y=_avgs_show, marker_color="#2563eb", text=_avgs_show, textposition="outside")])
                 _fig_usage.update_layout(title="各 Agent 平均耗时（秒）", height=260, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(_fig_usage, use_container_width=True, key="usage_agent_chart")
+                render_plotly_chart(_fig_usage, use_container_width=True, key="usage_agent_chart")
+                st.caption("📚 数据来源：本次会话 usage_history / agent_times 本地运行日志；不属于外部财务或市场数据。")
             else:
                 st.caption("完成一次研究后，这里会展示各 Agent 的耗时分布。")
         st.markdown('<div class="report-container">', unsafe_allow_html=True)
@@ -2775,7 +2897,7 @@ with col_main:
         # 🚩 风险雷达模型板块（真实财务指标映射 · 口径透明）
         with st.container():
             st.markdown('<div class="chart-box">', unsafe_allow_html=True)
-            st.write("#### 🚩 企业经营及财务多维风险指数测算（基于真实财务指标映射）")
+            st.write("#### 🚩 企业经营及财务多维风险指数测算（基于已载入指标映射，来源与质量见下方）")
 
             risk_data = data.get("risk_radar", {
                 "dimensions": ["偿债与财务杠杆风险", "短期流动性紧缺风险", "存货/资产减值风险", "盈利质量恶化风险", "政策合规与壁垒风险"],
@@ -2803,8 +2925,10 @@ with col_main:
                 margin=dict(l=20, r=20, t=40, b=20),
                 hoverlabel=dict(font=dict(size=11, color="#1e293b"), bgcolor="#f8fafc", bordercolor="#cbd5e1"),
             )
-            st.plotly_chart(fig_risk_radar, use_container_width=True, key="risk_radar_chart_bottom")
-            st.caption("📚 数据来源：真实财务指标映射（权益乘数/现金流质量/毛利率/ROE/行业政策基准，报告期见数据截止标注）")
+            render_plotly_chart(fig_risk_radar, use_container_width=True, key="risk_radar_chart_bottom")
+            _risk_basis = str(risk_data.get("based_on", "") or "")
+            _risk_quality = "默认口径/待核实" if "默认" in _risk_basis or "未匹配" in _risk_basis else "财务指标映射，需结合报告期核验"
+            st.caption(f"📚 数据来源：{_risk_basis or '财务指标映射'}；数据质量：{_risk_quality}")
 
             _risk_pdf = chart_pdf_bytes(fig_risk_radar)
             if _risk_pdf is not None:
@@ -2819,7 +2943,7 @@ with col_main:
                 st.caption(risk_data.get("based_on", ""))
                 for i, (d, m) in enumerate(zip(risk_data["dimensions"], risk_data.get("methodology", []))):
                     st.markdown(f"**{i+1}. {d}** → 风险 {risk_data['values'][i]}：{m}")
-                st.caption("注：数据均来自本地财务数据库（东方财富业绩报表聚合，报告期见页面数据截止标注）；"
+                st.caption("注：若上方标记为默认口径，数值仅用于演示；否则主要来自本地财务数据库（东方财富业绩报表聚合，报告期见页面数据截止标注）。"
                            "政策维度为公开监管信息基准值，可上传政策库/风险事件清单修正。")
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2873,7 +2997,7 @@ with col_main:
                         "title": "杜邦因子对标（公司 vs 行业）",
                         "caption": f"数据口径：ROE/净利润率/资产周转率/权益乘数，公司值与行业聚合值（报告期 {data.get('market_as_of','—')}）",
                         "png": _png,
-                        "source": f"公司财务指标（{data.get('company_name','')}）vs 东方财富业绩报表行业聚合（{data.get('market_as_of','—')}）",
+                        "source": f"公司财务指标（{data.get('company_name','')}）vs {data.get('data_note', '行业聚合来源待核实')}（{data.get('market_as_of','—')}）",
                         "notes": [
                             f"公司 ROE {data.get('company_roe','—')}% vs 行业 {data.get('industry_roe','—')}%",
                             f"公司净利率 {data.get('company_margin','—')}% vs 行业 {data.get('industry_margin','—')}%",
@@ -2881,38 +3005,38 @@ with col_main:
                         ],
                     }
                     _png = rex.render_chart_png("company_radar", data, title="标的公司与行业能力多维透视")
-                    _ci["radar"] = {"title": "能力多维透视雷达", "caption": "ROE/净利润率/资产周转率/财务杠杆/经营现金流（真实指标）", "png": _png,
-                                    "source": f"公司财务指标 vs 行业聚合（{data.get('market_as_of','—')}）",
+                    _ci["radar"] = {"title": "能力多维透视雷达", "caption": "ROE/净利润率/资产周转率/财务杠杆/经营现金流（已载入指标）", "png": _png,
+                                    "source": f"公司财务指标 vs {data.get('data_note', '行业聚合来源待核实')}（{data.get('market_as_of','—')}）",
                                     "notes": ["五项能力维度公司 vs 行业均值对比", "现金流维度单位：万元（公司）vs 行业每股现金流"]}
                     _png = rex.render_chart_png("dupont_waterfall", data, title="杜邦 ROE 差距归因")
                     _ci["waterfall"] = {"title": "杜邦 ROE 差距归因瀑布", "caption": "公司相对行业 ROE 差距的利润率/周转率/杠杆贡献分解",
-                                        "png": _png, "source": "对数分解示意（ln 差线性化），基数来自公司/行业真实财务指标",
+                                        "png": _png, "source": "对数分解示意（ln 差线性化）；" + data.get('data_note', '公司/行业指标来源待核实'),
                                         "notes": ["柱状从行业 ROE 起步，逐项叠加三要素贡献得到公司 ROE", "绿色=正向贡献，红色=负向贡献"]}
                 else:
                     _png = rex.render_chart_png("market_share", data.get("market_share", {}), title="行业市场集中度（CR4）")
-                    _ci["share"] = {"title": "行业竞争格局", "caption": f"CR4={data.get('market_share',{}).get('values',[0])[0]}%（东方财富业绩报表真实聚合）", "png": _png,
-                                    "source": f"东方财富业绩报表全市场聚合（报告期 {data.get('market_as_of','—')}）",
-                                    "notes": [f"行业 CR4 = {data.get('market_share',{}).get('values',[0])}%", "头部集中度反映竞争格局与定价权"]}
+                    _ci["share"] = {"title": "行业竞争格局", "caption": f"CR4={data.get('market_share',{}).get('values',[0])[0]}%（{data.get('data_note', '行业指标来源待核实')}）", "png": _png,
+                                    "source": data.get('data_note', f"行业指标来源待核实（报告期 {data.get('market_as_of','—')}）"),
+                                    "notes": [f"行业 CR4 = {data.get('market_share',{}).get('values',[0])[0]}%", "头部集中度反映竞争格局与定价权"]}
                     _png = rex.render_chart_png("market_growth", data.get("market_growth", {}), title="行业市场规模与复合增速")
                     _ci["growth"] = {"title": "市场规模与增速", "caption": "市场规模/增速为估算口径；趋势示意，详见缺口说明", "png": _png,
-                                     "source": "市场规模/增速为公开区间估算；CR4/ROE 等为真实聚合",
+                                     "source": data.get('data_note', '行业指标来源待核实') + "；市场规模/增速为公开区间估算",
                                      "notes": ["柱状=市场规模（亿元），折线=同比增速（%）", "增速逐年放缓属行业成熟期典型特征"]}
                     _png = rex.render_chart_png("financial_trend", data.get("financial_trend", {}), title="主要盈利指标变化趋势")
-                    _ci["trend"] = {"title": "盈利指标趋势", "caption": "最新期为真实聚合值，历史期为趋势示意", "png": _png,
-                                    "source": f"最新期=东方财富业绩报表（{data.get('market_as_of','—')}）；历史期=趋势示意",
+                    _ci["trend"] = {"title": "盈利指标趋势", "caption": f"{data.get('data_note', '行业指标来源待核实')}；历史期为趋势示意", "png": _png,
+                                    "source": f"{data.get('data_note', '行业指标来源待核实')}；历史期=趋势示意",
                                     "notes": ["ROE 与净利率双线走势", "用于判断行业盈利质量所处周期位置"]}
                     _png = rex.render_chart_png("capability_compare", data.get("capability_comparison", {}), title="企业多维核心财务能力对比")
-                    _ci["cap"] = {"title": "核心财务能力对比", "caption": "ROE/毛利率/CR4/净利率（真实聚合）", "png": _png,
-                                  "source": f"东方财富业绩报表聚合（{data.get('market_as_of','—')}）",
+                    _ci["cap"] = {"title": "核心财务能力对比", "caption": data.get('data_note', "行业指标来源待核实"), "png": _png,
+                                  "source": data.get('data_note', f"行业指标来源待核实（{data.get('market_as_of','—')}）"),
                                   "notes": ["横向条形展示行业核心财务能力", "盈利能力（ROE）与集中度（CR4）为主要观察维度"]}
                 # 产业链 + 风险雷达
                 _png = rex.render_chart_png("industry_chain", data.get("industry_chain", {}), title="产业链全景逻辑流")
                 _ci["chain"] = {"title": "产业链全景逻辑流", "caption": "环节→龙头→利润率（区间值·综合公开资料）", "png": _png,
-                                "source": "行业公开研究/公司年报/实时新闻检索（区间值）",
+                                "source": (data.get("industry_chain", {}) or {}).get("source_status", "行业公开研究/公司年报/实时新闻检索（区间值，需核验）"),
                                 "notes": ["五环节：上游→中游→整机→下游→服务", "悬停可查看业务/龙头/成本/利润率/实时动态"]}
                 _png = rex.render_chart_png("risk_radar", data.get("risk_radar", {}), title="企业经营及财务多维风险指数")
                 _ci["risk"] = {"title": "多维风险指数雷达", "caption": "0=安全，5=高危；口径见风险板块说明", "png": _png,
-                               "source": "真实财务指标映射（权益乘数/现金流质量/毛利率/ROE/政策基准）",
+                               "source": data.get('data_note', "已载入指标映射；来源待核实") + "；权益乘数/现金流质量/毛利率/ROE/政策基准",
                                "notes": ["五维风险：杠杆/流动性/减值/盈利/政策", "数值越高风险越大"]}
                 # 龙头对比 + 新闻来源（需求 5/7）
                 _leader_x = data.get("leader_data", {}) or {}
@@ -3002,4 +3126,3 @@ with col_main:
                     args=(_ex,),
                 )
         st.info("💡 也可以从左侧手动输入公司或行业，选择时间周期与研究目的后启动。")
-

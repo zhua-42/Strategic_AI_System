@@ -27,6 +27,11 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "financial_re
 META_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "market_meta.json")
 FRESH_SECONDS = 6 * 3600  # 6 小时内视为新鲜
 
+
+def _utc_now():
+    """UTC retrieval timestamp used for provenance and freshness displays."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
 # 报告期候选（优先最新）
 REPORT_PERIODS = [
     "20260630", "20260331", "20251231", "20250930",
@@ -189,6 +194,8 @@ def fetch_industry_live(industry, force=False):
             "sample_size": n,
             "data_as_of": period,
             "data_source": f"东方财富业绩报表(报告期{period})实时聚合, {n}家样本",
+            "source_status": "live_api",
+            "retrieved_at": _utc_now(),
         }
         # 写入行业基准表（供后续直接使用）
         try:
@@ -238,7 +245,9 @@ def fetch_company_live(company_name):
         df = ak.stock_financial_abstract(symbol=code)
         if df is None or len(df) == 0:
             return None
-        cols = [c for c in df.columns if str(c).isdigit() and len(str(c)) == 8]
+        today_key = datetime.date.today().strftime("%Y%m%d")
+        cols = [c for c in df.columns if str(c).isdigit() and len(str(c)) == 8
+                and str(c) <= today_key]
         if not cols:
             return None
         latest = sorted(cols)[-1]
@@ -263,6 +272,8 @@ def fetch_company_live(company_name):
             "eps": pick("基本每股收益"),
             "data_as_of": latest,
             "data_source": f"东方财富财务摘要接口实时抓取(报告期{latest})",
+            "source_status": "live_api",
+            "retrieved_at": _utc_now(),
         }
     except Exception as e:
         print(f"[data_updater] 公司实时抓取失败 {company_name}: {e}")
@@ -273,11 +284,21 @@ def fetch_performance_report():
     """拉取全市场业绩报表：优先最新报告期。返回 (df, period)。"""
     ak = _ak_import()
     for period in REPORT_PERIODS:
+        # Never accept a future report period if the static candidate list is
+        # left unchanged after a calendar rollover.
+        if str(period) > datetime.date.today().strftime("%Y%m%d"):
+            continue
         try:
             df = ak.stock_yjbb_em(date=period)
-            if df is not None and len(df) > 0:
+            # A non-empty response is not sufficient: verify the schema before
+            # treating it as a financial report and writing it to the database.
+            cols = {str(c).strip() for c in (df.columns if df is not None else [])}
+            has_identity = any("股票代码" in c or c in {"股票代码", "证券代码"} for c in cols)
+            has_period_metric = any("营业总收入" in c or "净利润" in c for c in cols)
+            if df is not None and len(df) > 0 and has_identity and has_period_metric:
                 _log(f"业绩报表拉取成功: 报告期={period} 行数={len(df)}")
                 return df, period
+            _log(f"报告期 {period} 返回空或字段不完整，跳过")
         except Exception as e:
             _log(f"报告期 {period} 失败: {e}")
     return None, None
@@ -301,8 +322,10 @@ def fetch_kpi_abstract(symbol):
             return None
         data = df.set_index("指标") if "指标" in df.columns else df
         latest_col = None
+        today_key = datetime.date.today().strftime("%Y%m%d")
         for col in reversed(list(data.columns)):
-            if col not in ("选项", "指标") and str(col).isdigit() and len(str(col)) == 8:
+            if (col not in ("选项", "指标") and str(col).isdigit() and len(str(col)) == 8
+                    and str(col) <= today_key):
                 latest_col = col
                 break
         if latest_col is None:
@@ -321,6 +344,9 @@ def fetch_kpi_abstract(symbol):
             "revenue": to_num(_pick(series, "营业总收入")),
             "net_profit": to_num(_pick(series, "归母净利润")),
             "eps": to_num(_pick(series, "基本每股收益")),
+            "data_source": f"东方财富财务摘要接口（报告期{latest_col}）",
+            "source_status": "live_api",
+            "retrieved_at": _utc_now(),
         }
     except Exception as e:
         _log(f"个股 {symbol} 财务摘要失败: {e}")
@@ -354,9 +380,11 @@ def refresh_market_data(force=False, verbose=True):
 
     df, period = fetch_performance_report()
     if df is None:
-        _log("警告：全市场业绩报表拉取失败，保留旧数据。")
+        _log("警告：全市场业绩报表拉取失败，保留旧数据；旧数据不得标记为实时。")
         meta["last_error"] = "stock_yjbb_em 拉取失败"
         meta["last_try"] = datetime.datetime.now().isoformat()
+        meta["source_status"] = "stale_previous_data"
+        meta["data_quality"] = "旧数据（本次刷新失败）"
         write_meta(meta)
         return meta
 
@@ -515,10 +543,13 @@ def refresh_market_data(force=False, verbose=True):
 
     meta = {
         "last_refresh": datetime.datetime.now().isoformat(),
+        "retrieved_at": _utc_now(),
         "report_period": period,
         "industries": written,
         "companies_total": int(len(df)) if df is not None else 0,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_status": "live_api",
+        "data_quality": "东方财富业绩报表实时抓取并聚合",
     }
     write_meta(meta)
     _log(f"完成: 报告期={period} 行业={written} 公司={meta['companies_total']}")

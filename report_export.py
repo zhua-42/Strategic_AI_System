@@ -22,6 +22,7 @@ import re
 import datetime
 
 import pandas as pd
+from chart_utils import sanitize_json
 
 # ---------- 主题色（JPMC / Deloitte 融合） ----------
 C_NAVY = "#0F2A5C"      # 深蓝（JPMC 主色，替代原来的 #1e3a8a）
@@ -119,7 +120,7 @@ def _fmt(v, nd=1):
 def render_chart_png(chart_type, data=None, is_company_mode=False, title="", subtitle=""):
     import matplotlib.pyplot as plt
     setup_font()
-    data = data or {}
+    data = sanitize_json(data or {})
     fig = None
 
     def _make(figsize=(7.4, 4.2)):
@@ -985,8 +986,8 @@ def _auto_notes(cid, ch):
     if caption:
         notes.append(caption)
     notes.append("上图展示了该维度的核心数据与对比口径。")
-    if source:
-        notes.append("数据来源：" + source)
+    # 每张图都保留来源行；缺失来源时明确标注待核验，避免将示例数据误读为事实。
+    notes.append("数据来源：" + (source or "未提供（待补充并核验）"))
     return notes[:5]
 
 
@@ -996,8 +997,7 @@ def _add_chart_block(doc_or_slide, png, caption, source=""):
     try:
         doc_or_slide.add_picture(BytesIO(png), width=Inches(5.9))
         cap = f"图注：{caption}"
-        if source:
-            cap += f"\n数据来源：{source}"
+        cap += f"\n数据来源：{source or '未提供（待补充并核验）'}"
         doc_or_slide.add_paragraph(cap)
     except Exception as e:
         doc_or_slide.add_paragraph(f"[图表插入失败: {e}]")

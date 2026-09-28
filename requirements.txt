@@ -10,6 +10,9 @@ matplotlib>=3.8.0
 kaleido==0.2.1
 akshare>=1.18.0
 pandas>=2.0.0
+xlsxwriter>=3.2.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
 pdfplumber
 # chromadb 固定到 0.5.x 稳定线：1.x 引入 Rust 绑定，在部分云端环境（如 Streamlit Cloud）
 # 初始化失败（AttributeError: del self.bindings，见 chroma-core/chroma#5868）。

@@ -21,7 +21,11 @@ import os
 import time
 import datetime
 
-import requests
+try:
+    import requests
+except Exception as _requests_error:
+    requests = None
+    print(f"[News] requests 不可用，将只使用本地缓存/可用数据源: {_requests_error}")
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -38,6 +42,30 @@ _CODE_CACHE_TTL = 6 * 3600
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 _MARKET_ANN_CACHE = os.path.join(_CACHE_DIR, "news_market_announcements.json")
 _MARKET_ANN_TTL = 12 * 3600
+
+
+def _retrieved_at():
+    """Return an ISO-8601 UTC timestamp for provenance in UI/export rows."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _result(ok, items=None, note="", source="", *, attempted=True,
+            fetched_at=None, from_cache=False):
+    """Build a consistent source result and never call an empty response live."""
+    clean_items = _norm(items or [])
+    return {
+        "ok": bool(ok and clean_items),
+        "items": clean_items,
+        "note": note,
+        "source": source,
+        "attempted": bool(attempted),
+        "fetched_at": fetched_at or _retrieved_at(),
+        "from_cache": bool(from_cache),
+        "has_citable_url": any(
+            str(x.get("url") or "").lower().startswith(("http://", "https://"))
+            for x in clean_items
+        ),
+    }
 
 
 def _cache_get(path, ttl):
@@ -71,11 +99,16 @@ def _norm(items):
         if not title or title in seen:
             continue
         seen.add(title)
+        source = str(it.get("source") or "未知来源（待核实）")[:80]
+        raw_url = str(it.get("url") or "").strip()
+        # pandas/akshare frequently serializes missing links as literal
+        # strings such as "nan" or "None"; these are not citable URLs.
+        url = "" if raw_url.lower() in {"nan", "none", "null", "n/a", "-"} else raw_url
         out.append({
             "title": title[:200],
             "date": str(it.get("date") or "")[:20],
-            "source": str(it.get("source") or "")[:40],
-            "url": str(it.get("url") or ""),
+            "source": source,
+            "url": url,
             "summary": str(it.get("summary") or "")[:400],
         })
     return out[:30]
@@ -89,7 +122,8 @@ def fetch_company_announcements(company_name="", stock_code="", days=30):
         if not stock_code:
             stock_code = lookup_stock_code(company_name)
         if not stock_code:
-            return {"ok": False, "items": [], "note": "未找到该公司的股票代码，无法抓取公告"}
+            return _result(False, note="未找到该公司的股票代码，无法抓取公告",
+                           source="东方财富·个股公告")
         begin = _today(-days)
         end = _today()
         df = ak.stock_individual_notice_report(security=stock_code, symbol="全部",
@@ -103,10 +137,13 @@ def fetch_company_announcements(company_name="", stock_code="", days=30):
                 "url": str(r.get("网址", "")),
                 "summary": str(r.get("公告类型", "")),
             })
-        return {"ok": True, "items": _norm(items),
-                "note": f"东方财富公告大全 · {company_name or stock_code} 近{days}天"}
+        return _result(bool(items), items,
+                       f"东方财富公告大全 · {company_name or stock_code} 近{days}天" if items
+                       else f"东方财富公告大全 · {company_name or stock_code} 近{days}天无结果",
+                       source="东方财富·个股公告")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"公告抓取失败: {str(e)[:120]}"}
+        return _result(False, note=f"公告抓取失败: {str(e)[:120]}",
+                       source="东方财富·个股公告")
 
 
 def fetch_market_announcements(days=1, keyword="", limit=20):
@@ -120,6 +157,9 @@ def fetch_market_announcements(days=1, keyword="", limit=20):
                 df = ak.stock_notice_report(symbol="全部", date=_today(-1))
             cached = df.to_dict("records")
             _cache_set(_MARKET_ANN_CACHE, cached)
+            from_cache = False
+        else:
+            from_cache = True
         items = []
         for r in cached:
             title = str(r.get("公告标题", ""))
@@ -133,10 +173,13 @@ def fetch_market_announcements(days=1, keyword="", limit=20):
                 "url": str(r.get("网址", "")),
                 "summary": f"{name} · {r.get('公告类型', '')}",
             })
-        return {"ok": True, "items": _norm(items)[:limit],
-                "note": "东方财富全市场公告" + (f"· 关键词「{keyword}」" if keyword else "")}
+        return _result(bool(items), items[:limit],
+                       "东方财富全市场公告" + (f"· 关键词「{keyword}」" if keyword else "")
+                       + ("（无匹配结果）" if not items else ""),
+                       source="东方财富·全市场公告", from_cache=from_cache)
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"全市场公告抓取失败: {str(e)[:120]}"}
+        return _result(False, note=f"全市场公告抓取失败: {str(e)[:120]}",
+                       source="东方财富·全市场公告")
 
 
 # ---------------------------------------------------------------- 快讯
@@ -170,10 +213,13 @@ def fetch_7x24_news(keyword="", pages=3, limit=15):
             if not hits:
                 hits = [it for it in items if keyword in it.get("summary", "")]
             items = hits or items  # 未命中则返回最新头条
-        return {"ok": True, "items": _norm(items)[:limit],
-                "note": "东方财富 7×24 实时快讯" + (f"· 关键词「{keyword}」" if keyword else "")}
+        return _result(bool(items), items[:limit],
+                       "东方财富 7×24 实时快讯" + (f"· 关键词「{keyword}」" if keyword else "")
+                       + ("（无匹配结果）" if not items else ""),
+                       source="东方财富·7×24快讯")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"快讯抓取失败: {str(e)[:120]}"}
+        return _result(False, note=f"快讯抓取失败: {str(e)[:120]}",
+                       source="东方财富·7×24快讯")
 
 
 # ---------------------------------------------------------------- 财经新闻
@@ -191,9 +237,11 @@ def fetch_caixin_news(limit=15):
                 "url": str(r.get("url", "")),
                 "summary": str(r.get("tag", "")),
             })
-        return {"ok": True, "items": _norm(items)[:limit], "note": "财新网财经新闻"}
+        return _result(bool(items), items[:limit],
+                       "财新网财经新闻" + ("（无结果）" if not items else ""),
+                       source="财新网")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"财新新闻抓取失败: {str(e)[:120]}"}
+        return _result(False, note=f"财新新闻抓取失败: {str(e)[:120]}", source="财新网")
 
 
 def fetch_cctv_news(limit=15):
@@ -212,9 +260,12 @@ def fetch_cctv_news(limit=15):
                 "url": "",
                 "summary": str(r.get("content", ""))[:200],
             })
-        return {"ok": True, "items": _norm(items)[:limit], "note": "新闻联播文字稿"}
+        return _result(bool(items), items[:limit],
+                       "新闻联播文字稿" + ("（无结果）" if not items else ""),
+                       source="新闻联播文字稿")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"新闻联播抓取失败: {str(e)[:120]}"}
+        return _result(False, note=f"新闻联播抓取失败: {str(e)[:120]}",
+                       source="新闻联播文字稿")
 
 
 # ---------------------------------------------------------------- 网络搜索
@@ -248,9 +299,10 @@ def search_web_news(keyword, limit=10):
                     link = q["url"][0]
             items.append({"title": title, "date": "", "source": source,
                           "url": link, "summary": summary[:200]})
-        return {"ok": True, "items": _norm(items), "note": f"搜狗新闻搜索 · {keyword}"}
+        return _result(bool(items), items, f"搜狗新闻搜索 · {keyword}"
+                       + ("（无结果）" if not items else ""), source="搜狗新闻搜索")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"网络搜索失败: {str(e)[:120]}"}
+        return _result(False, note=f"网络搜索失败: {str(e)[:120]}", source="搜狗新闻搜索")
 
 
 def _resolve_sogou_link(link):
@@ -305,9 +357,10 @@ def search_web_pages(keyword, limit=8):
             summary = summary_node.get_text(strip=True) if summary_node else ""
             items.append({"title": title, "date": "", "source": source,
                           "url": _resolve_sogou_link(link), "summary": summary[:200]})
-        return {"ok": True, "items": _norm(items), "note": f"搜狗网页搜索 · {keyword}"}
+        return _result(bool(items), items, f"搜狗网页搜索 · {keyword}"
+                       + ("（无结果）" if not items else ""), source="搜狗网页搜索")
     except Exception as e:
-        return {"ok": False, "items": [], "note": f"网页搜索失败: {str(e)[:120]}"}
+        return _result(False, note=f"网页搜索失败: {str(e)[:120]}", source="搜狗网页搜索")
 
 
 # ---------------------------------------------------------------- 代码查询
@@ -343,40 +396,60 @@ def fetch_news_bundle(company_name="", industry="", keyword="", days=30, limit_e
     """
     kw = keyword or company_name or industry
     bundle = []
+    source_status = []
+
+    def _record(label, result):
+        source_status.append({
+            "source": label,
+            "ok": bool(result.get("ok")),
+            "count": len(result.get("items") or []),
+            "note": result.get("note", ""),
+            "fetched_at": result.get("fetched_at", ""),
+            "from_cache": bool(result.get("from_cache", False)),
+            "has_citable_url": bool(result.get("has_citable_url", False)),
+        })
+        return result
 
     # 1) 个股公告（公司模式）
     if company_name:
-        ann = fetch_company_announcements(company_name, days=days)
+        ann = _record("东方财富·个股公告", fetch_company_announcements(company_name, days=days))
         if ann["items"]:
             bundle += ann["items"]
 
     # 2) 全市场公告按关键词过滤（行业模式也能命中公司公告）
     if industry or company_name:
-        mk = fetch_market_announcements(days=1, keyword=kw, limit=limit_each)
+        mk = _record("东方财富·全市场公告", fetch_market_announcements(days=1, keyword=kw, limit=limit_each))
         if mk["items"]:
             bundle += mk["items"]
 
     # 3) 7x24 快讯按关键词过滤
-    flash = fetch_7x24_news(keyword=kw, pages=2, limit=limit_each)
+    flash = _record("东方财富·7×24快讯", fetch_7x24_news(keyword=kw, pages=2, limit=limit_each))
     if flash["items"]:
         bundle += flash["items"]
 
     # 4) 搜狗网络搜索（关键词）
-    web = search_web_news(kw, limit=limit_each)
+    web = _record("搜狗新闻搜索", search_web_news(kw, limit=limit_each))
     if web["items"]:
         bundle += web["items"]
 
     # 5) 兜底：行业关键词的财新/央视新闻（当上面都空时）
     if not bundle:
         for fn in (fetch_caixin_news, fetch_cctv_news):
-            r = fn(limit=limit_each)
+            r = _record(fn.__name__, fn(limit=limit_each))
             if r["items"]:
                 bundle += r["items"]
 
-    sources = ["东方财富公告大全", "东方财富全市场公告", "东方财富7×24快讯",
-               "搜狗新闻搜索", "财新网", "新闻联播"]
-    return {"ok": bool(bundle), "items": _norm(bundle)[:30], "sources": sources,
-            "note": "实时公开信息（公告/快讯/网络搜索，无需付费 API）"}
+    # Only advertise sources that were actually attempted.  This prevents a
+    # chart/report from implying that an uncalled provider supplied data.
+    sources = [row["source"] for row in source_status]
+    ok_count = sum(1 for item in source_status if item["ok"] and item["count"] > 0)
+    normalized = _norm(bundle)[:30]
+    return {"ok": bool(normalized), "items": normalized, "sources": sources,
+            "source_status": source_status, "successful_sources": ok_count,
+            "fetched_at": _retrieved_at(),
+            "note": f"实时公开信息；成功返回 {ok_count}/{len(source_status)} 个来源（失败来源不阻断流程）"
+                    if normalized else
+                    f"未获取到可引用公开信息；成功返回 {ok_count}/{len(source_status)} 个来源，不能视为最新事实"}
 
 
 def format_items_markdown(items, max_items=10):

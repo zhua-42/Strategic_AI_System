@@ -509,7 +509,7 @@ def build_chain_payload(industry_name):
         只匹配带 % 的数字，避免把年份（2024/2025）等误当利润率。"""
         nums = re.findall(r"(\d+(?:\.\d+)?)\s*%", str(text or ""))
         if not nums:
-            return 0.0
+            return None
         vals = [float(x) for x in nums]
         return round(sum(vals) / len(vals), 1)
 
@@ -529,8 +529,15 @@ def build_chain_payload(industry_name):
             "margin": seg["margin"],
             "features": seg["features"],
             "source": seg["source"],
+            "source_type": "curated_industry_library" if matched else "generic_framework",
+            # Curated rows are useful research ranges, but they are not a live
+            # quote and each range is not independently audited at runtime.
+            # Keep that limitation explicit for chart captions/exports.
+            "data_quality": "综合公开资料区间值（未逐项核验）" if matched else "通用框架（无实数，待上传资料校正）",
+            "source_url": "",
+            "source_status": "静态行业知识库；非实时行情",
         })
-    note = "环节成本与利润率为区间值·综合公开资料（详见各环节 hover 数据来源）。"
+    note = "环节成本与利润率为区间值·综合公开资料，运行时未逐项核验；不是实时行情（详见各环节 hover 数据来源）。"
     if matched is None:
         note = "该行业暂未收录细分产业链库，已展示「通用产业链框架」；系统已通过实时新闻/公告检索补充该行业动态，建议上传行业研报进一步细化。"
     return {
@@ -539,6 +546,9 @@ def build_chain_payload(industry_name):
         "nodes": nodes,
         "stage_colors": CHAIN_THEME,
         "note": note,
+        "data_quality": "curated_range_unverified" if matched else "generic_framework_no_numeric_data",
+        "source_status": "已匹配静态行业知识库（区间值未逐项核验）" if matched else "未匹配细分库，使用通用框架（无实时数值）",
+        "source_urls": [],
     }
 
 

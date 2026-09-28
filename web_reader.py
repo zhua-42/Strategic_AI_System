@@ -18,8 +18,13 @@
 """
 import json
 import re
+import datetime
 
-import requests
+try:
+    import requests
+except Exception as _requests_error:
+    requests = None
+    print(f"[Web Reader] requests 不可用，网页读取功能将按本地资料运行: {_requests_error}")
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -27,6 +32,10 @@ UA = {
     "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
+
+
+def _retrieved_at():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _safe_json(text):
@@ -168,12 +177,15 @@ def extract_tables_from_html(soup):
 def read_webpage(url, timeout=15):
     """读取网页：文字 + 表格 + 图表数据 + 图片说明。"""
     try:
+        if requests is None:
+            return {"ok": False, "title": "", "text": "", "tables": [], "charts": [], "images": [],
+                    "source_url": url, "fetched_at": _retrieved_at(), "note": "requests 依赖未安装"}
         from bs4 import BeautifulSoup
         r = requests.get(url, headers=UA, timeout=timeout)
         if r.status_code != 200:
             return {"ok": False, "title": "", "text": "",
                     "tables": [], "charts": [], "images": [],
-                    "note": f"HTTP {r.status_code}"}
+                    "source_url": url, "fetched_at": _retrieved_at(), "note": f"HTTP {r.status_code}"}
         r.encoding = r.apparent_encoding or r.encoding
         html = r.text
         soup = BeautifulSoup(html, "lxml")
@@ -192,18 +204,23 @@ def read_webpage(url, timeout=15):
         charts = extract_charts_from_html(html)
         images = [{"alt": (img.get("alt") or "")[:80], "src": img.get("src", "")[:150]}
                   for img in soup.select("img")[:12] if img.get("src") or img.get("alt")]
-        return {"ok": True, "title": title, "text": text,
+        has_content = bool(title or text or tables or charts)
+        return {"ok": has_content, "title": title, "text": text,
                 "tables": tables, "charts": charts, "images": images,
-                "note": f"已读取 {len(blocks)} 段正文 / {len(tables)} 张表格 / {len(charts)} 组图表数据"}
+                "source_url": url, "fetched_at": _retrieved_at(),
+                "note": (f"已读取 {len(blocks)} 段正文 / {len(tables)} 张表格 / {len(charts)} 组图表数据"
+                         if has_content else "页面返回成功但未提取到可引用内容")}
     except Exception as e:
         return {"ok": False, "title": "", "text": "",
                 "tables": [], "charts": [], "images": [],
+                "source_url": url, "fetched_at": _retrieved_at(),
                 "note": f"网页读取失败: {str(e)[:150]}"}
 
 
 def format_page_summary(page, max_text=1200):
     """把网页读取结果格式化为报告可引用的文本。"""
-    parts = [f"【网页】{page.get('title', '')}（{page.get('note', '')}）"]
+    provenance = f"来源：{page.get('source_url', '未提供')}；抓取时间：{page.get('fetched_at', '未记录')}"
+    parts = [f"【网页】{page.get('title', '')}（{page.get('note', '')}；{provenance}）"]
     txt = (page.get("text") or "").strip()
     if txt:
         parts.append("正文摘录：\n" + txt[:max_text])
