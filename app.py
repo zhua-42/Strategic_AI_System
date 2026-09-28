@@ -1658,6 +1658,10 @@ with st.sidebar:
         research_target = st.radio("研究对象类型", ["公司", "行业"], key="research_target")
         if research_target == "公司":
             company_query = st.text_input("输入公司名称", placeholder="如：比亚迪", key="company_query")
+            if st.session_state.get("period_type") not in {"季度", "半年", "年度"}:
+                st.session_state.pop("period_type", None)
+            if st.session_state.get("report_type") not in {"季报", "半年报", "年报", "公司深度专题"}:
+                st.session_state.pop("report_type", None)
             period_type = st.selectbox("选择报告周期", ["季度", "半年", "年度"], key="period_type")
             year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
             if period_type == "季度":
@@ -1671,6 +1675,10 @@ with st.sidebar:
             report_type = st.selectbox("报告类型", ["季报", "半年报", "年报", "公司深度专题"], key="report_type")
         else:
             query = st.text_input("输入行业", placeholder="如：新能源汽车", key="query")
+            if st.session_state.get("period_type") not in {"周度", "月度", "半年", "年度"}:
+                st.session_state.pop("period_type", None)
+            if st.session_state.get("report_type") not in {"周报", "月报", "半年报", "年报", "行业专题"}:
+                st.session_state.pop("report_type", None)
             period_type = st.selectbox("选择报告周期", ["周度", "月度", "半年", "年度"], key="period_type")
             year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
             if period_type == "周度":
