@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-报告文档导出引擎（Word / PPT / 图表渲染）· 2026 大改版
+报告文档导出引擎（Word / PPT / PDF / 图表渲染）· 2026 大改版
 =====================================================
 设计目标（参考 JPMC Forage《Task 2 JPMC.pptx》与券商研报版式）：
 
@@ -14,6 +14,7 @@
 对外接口：
     render_chart_png(chart_type, data, ...) -> PNG bytes
     export_docx(...) -> Word bytes
+    export_pdf(...) -> PDF bytes
     export_pptx(...) -> PPT bytes
 """
 import io
@@ -615,6 +616,209 @@ def export_docx(query, report_text, chart_images, evidence_data=None, gap_data=N
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
+
+
+# ---------------- PDF（券商研报图表版式） ----------------
+def export_pdf(query, report_text, chart_images, evidence_data=None, gap_data=None,
+               meta=None, is_company_mode=True, source_text=""):
+    """导出可直接下载的完整 PDF 研报。
+
+    版式按案例研报组织：封面、数据口径、核心图表（两列网格且每图保留来源小字）、
+    证据链、正文、Pro Forma 财务报表附录、缺口与免责声明。
+    """
+    from html import escape
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph,
+                                    Spacer, PageBreak, Table, TableStyle, Image,
+                                    KeepTogether)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    # 先注册仓库内字体，云端和本地均可复现中文；字体不可用时回退 Helvetica。
+    font_name = "Helvetica"
+    try:
+        pdfmetrics.registerFont(TTFont("SAS-NotoSansSC", FONT_BUNDLED))
+        font_name = "SAS-NotoSansSC"
+    except Exception:
+        for _cand in FONT_CANDIDATES:
+            try:
+                if isinstance(_cand, str) and os.path.isfile(_cand):
+                    pdfmetrics.registerFont(TTFont("SAS-Fallback", _cand))
+                    font_name = "SAS-Fallback"
+                    break
+            except Exception:
+                continue
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("SASCoverTitle", parent=styles["Title"], fontName=font_name,
+                                 fontSize=22, leading=28, alignment=TA_CENTER,
+                                 textColor=colors.HexColor(C_NAVY), spaceAfter=12)
+    subtitle_style = ParagraphStyle("SASCoverSub", parent=styles["Normal"], fontName=font_name,
+                                    fontSize=10, leading=15, alignment=TA_CENTER,
+                                    textColor=colors.HexColor(C_SLATE), spaceAfter=8)
+    h1 = ParagraphStyle("SASH1", parent=styles["Heading1"], fontName=font_name,
+                        fontSize=15, leading=20, textColor=colors.HexColor(C_NAVY),
+                        spaceBefore=9, spaceAfter=7)
+    h2 = ParagraphStyle("SASH2", parent=styles["Heading2"], fontName=font_name,
+                        fontSize=11, leading=15, textColor=colors.HexColor(C_BLUE),
+                        spaceBefore=7, spaceAfter=4)
+    body = ParagraphStyle("SASBody", parent=styles["BodyText"], fontName=font_name,
+                          fontSize=9.2, leading=14, textColor=colors.HexColor(C_SLATE),
+                          spaceAfter=5)
+    small = ParagraphStyle("SASSmall", parent=styles["BodyText"], fontName=font_name,
+                           fontSize=7.2, leading=9.5, textColor=colors.HexColor(C_MID),
+                           spaceAfter=2)
+    chart_title = ParagraphStyle("SASChartTitle", parent=body, fontName=font_name,
+                                 fontSize=9, leading=12, textColor=colors.HexColor(C_NAVY),
+                                 spaceAfter=3)
+
+    def _para(text, style=body):
+        text = clean_export_text(str(text or ""))
+        text = escape(text).replace("\n", "<br/>")
+        return Paragraph(text, style)
+
+    def _table(data, widths, header=True, font_size=7.5):
+        tbl = Table(data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+        cmds = [
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor(C_BORDER)),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("FONTNAME", (0, 0), (-1, -1), font_name),
+            ("FONTSIZE", (0, 0), (-1, -1), font_size),
+            ("LEADING", (0, 0), (-1, -1), font_size + 2),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        if header:
+            cmds += [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(C_NAVY)),
+                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                     ("FONTNAME", (0, 0), (-1, 0), font_name)]
+        tbl.setStyle(TableStyle(cmds))
+        return tbl
+
+    def _footer(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor(C_BORDER))
+        canvas.line(1.5 * cm, 1.15 * cm, A4[0] - 1.5 * cm, 1.15 * cm)
+        canvas.setFont(font_name, 7)
+        canvas.setFillColor(colors.HexColor(C_MID))
+        canvas.drawString(1.5 * cm, 0.75 * cm, "数据可溯源研报 · 图表下方均标注来源")
+        canvas.drawRightString(A4[0] - 1.5 * cm, 0.75 * cm, f"第 {doc.page} 页")
+        canvas.restoreState()
+
+    story = []
+
+    # 封面与元信息
+    story += [Spacer(1, 2.1 * cm), _para(query or "智能投研研究报告", title_style),
+              _para(f"{(meta or {}).get('报告类型', '深度研究')} · {(meta or {}).get('分析周期', '默认近三年+最新季度')}", subtitle_style),
+              _para("多智能体智能投研系统 · 案例研报图表版式", subtitle_style),
+              Spacer(1, 0.55 * cm)]
+    meta_rows = [[_para("报告字段", small), _para("内容", small)]]
+    for k, v in (meta or {}).items():
+        meta_rows.append([_para(k, small), _para(v, small)])
+    if source_text:
+        meta_rows.append([_para("补充来源", small), _para(source_text, small)])
+    story.append(_table(meta_rows, [4.0 * cm, 12.6 * cm], header=True, font_size=7.5))
+    story += [Spacer(1, 0.35 * cm), _para("本报告按用户提供的行业/个股研报案例组织，数据事实以报告内标注的公告、财报、数据库或用户上传底稿为准。", small), PageBreak()]
+
+    # 核心图表：两列网格，保证案例中常见的“图表 + 图注 + 来源”组合。
+    story.append(_para("第一部分：核心图表与数据看板", h1))
+    chart_items = list((chart_images or {}).values())
+    if chart_items:
+        for idx in range(0, len(chart_items), 2):
+            row = []
+            for ch in chart_items[idx:idx + 2]:
+                cell = [_para(ch.get("title", "图表"), chart_title)]
+                png = ch.get("png")
+                if png:
+                    try:
+                        from PIL import Image as PILImage
+                        pil = PILImage.open(io.BytesIO(png))
+                        iw, ih = pil.size
+                        width = 7.6 * cm
+                        height = max(3.3 * cm, min(6.2 * cm, width * ih / max(iw, 1)))
+                        cell.append(Image(io.BytesIO(png), width=width, height=height))
+                    except Exception:
+                        cell.append(_para("[图表图片暂不可用，数据仍保留在网页和导出表中]", small))
+                cell.append(_para(ch.get("caption", ""), small))
+                cell.append(_para("来源：" + (ch.get("source", "") or "待核验"), small))
+                row.append(cell)
+            if len(row) == 1:
+                row.append([_para("", small)])
+            grid = Table([row], colWidths=[8.15 * cm, 8.15 * cm], hAlign="LEFT")
+            grid.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                      ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                                      ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                                      ("TOPPADDING", (0, 0), (-1, -1), 3),
+                                      ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+            story.append(grid)
+    else:
+        story.append(_para("本次研究未生成图表。", body))
+
+    # 证据链
+    story.append(_para("第二部分：数据可信度证据链", h1))
+    if evidence_data:
+        rows = [[_para(x, small) for x in ["审计论点", "数据来源", "位置/页码", "可信度"]]]
+        for item in evidence_data:
+            rows.append([_para(item.get("point", ""), small), _para(item.get("source", ""), small),
+                         _para(item.get("page", ""), small), _para(item.get("confidence", ""), small)])
+        story.append(_table(rows, [6.0 * cm, 5.0 * cm, 3.2 * cm, 2.0 * cm], header=True))
+    else:
+        story.append(_para("暂无证据链条目，涉及最新事实的数字需要在生成前补充公开来源。", body))
+
+    # 正文与 markdown 表格
+    story.append(_para("第三部分：深度研究报告正文", h1))
+    clean_body, md_tables = split_markdown_tables(report_text)
+    for lvl, title, lines in _split_sections(clean_body):
+        story.append(_para(title, h2 if lvl <= 2 else body))
+        for line in lines:
+            if line.strip():
+                story.append(_para(line, body))
+    for tbl in md_tables:
+        if tbl.get("headers") and tbl.get("rows"):
+            rows = [[_para(x, small) for x in tbl["headers"]]]
+            rows += [[_para(x, small) for x in r] for r in tbl["rows"]]
+            widths = [16.2 * cm / max(1, len(tbl["headers"]))] * len(tbl["headers"])
+            story.append(_table(rows, widths, header=True))
+            story.append(Spacer(1, 0.15 * cm))
+
+    # Pro Forma 财务附录：字段对齐用户提供的中信证券模板。
+    story.append(PageBreak())
+    story.append(_para("第四部分：Pro Forma 财务报表附录", h1))
+    story.append(_para("字段与勾稽关系参考用户提供的《中信证券通用模拟财务报表（Pro Forma）全模板》；空白金额由用户上传的财报或模型假设填入，网页不会把空白项当作真实数据。", body))
+    proforma = [
+        ("合并模拟利润表", [("营业总收入", "营业收入=上期收入×(1+增速)"), ("营业成本", "收入×(1-毛利率)"), ("营业利润", "收入-成本-税费-销售/管理/研发/财务费用"), ("净利润", "利润总额-所得税"), ("归母净利润", "净利润×归母比例"), ("EBITDA", "营业利润+折旧摊销+利息支出")]),
+        ("合并模拟资产负债表", [("货币资金", "期初现金+现金流量表净增加额"), ("应收账款", "收入÷360×DSO"), ("存货", "营业成本÷360×存货周转天数"), ("固定资产", "期初+CAPEX-折旧"), ("有息负债", "融资计划与偿债计划"), ("资产/负债权益总计", "资产总计=负债合计+所有者权益合计")]),
+        ("合并模拟现金流量表", [("净利润", "引用利润表"), ("折旧摊销/利息", "引用利润表与资产负债表"), ("营运资本变动", "期初期末应收、存货、应付差额"), ("CAPEX", "引用资本开支假设"), ("经营活动现金流", "间接法加总"), ("期末现金", "必须等于资产负债表货币资金")]),
+        ("合并模拟所有者权益变动表", [("期初权益", "引用上年期末"), ("净利润", "引用利润表归母净利润"), ("增发/回购", "引用筹资假设"), ("分红/盈余公积", "引用分红政策与净利润"), ("期末权益", "必须等于资产负债表所有者权益合计")]),
+    ]
+    for title, items in proforma:
+        story.append(_para(title, h2))
+        rows = [[_para(x, small) for x in ["项目", "基准期", "模拟期1", "模拟期2", "模拟期3", "勾稽说明"]]]
+        for item, note in items:
+            rows.append([_para(item, small), _para("待补充", small), _para("待补充", small), _para("待补充", small), _para("待补充", small), _para(note, small)])
+        story.append(_table(rows, [3.0 * cm, 2.1 * cm, 2.1 * cm, 2.1 * cm, 2.1 * cm, 4.8 * cm], header=True, font_size=7.0))
+
+    story.append(_para("第五部分：资料缺口与风险提示", h1))
+    if gap_data:
+        for gap in gap_data:
+            story.append(_para("• " + str(gap), body))
+    else:
+        story.append(_para("本次研究未记录额外资料缺口。", body))
+    story.append(_para("免责声明", h2))
+    story.append(_para("本报告由 AI 多智能体系统自动生成，所有数据来源已在正文、图表与证据链中标注；内容仅供学习与研究参考，不构成任何投资建议。投资决策与风险由使用者自行承担。", body))
+
+    out = io.BytesIO()
+    doc = BaseDocTemplate(out, pagesize=A4, leftMargin=1.5 * cm,
+                          rightMargin=1.5 * cm, topMargin=1.35 * cm, bottomMargin=1.55 * cm)
+    doc.addPageTemplates([PageTemplate(id="SAS", frames=Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal"), onPage=_footer)])
+    doc.build(story)
+    return out.getvalue()
 
 
 # ---------------- PPT（JPMC 风格） ----------------

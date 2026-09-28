@@ -1299,7 +1299,8 @@ def assess_data_gaps(company_name="", industry_name="", is_company_mode=False, r
     return gaps
 
 
-def build_report_meta(db_data=None, company_data=None, is_company_mode=False):
+def build_report_meta(db_data=None, company_data=None, is_company_mode=False,
+                      report_type="深度研究", period="默认近三年+最新季度"):
     """报告元信息：数据鲜度、来源、口径。"""
     db = db_data or {}
     meta = {}
@@ -1309,6 +1310,10 @@ def build_report_meta(db_data=None, company_data=None, is_company_mode=False):
     if company_data:
         meta["公司数据来源"] = f"{company_data.get('name')}（{company_data.get('year', '报告年度')}）财务指标"
     meta["产业链数据"] = "行业环节成本/利润率为区间值·综合公开资料（见各环节说明）"
+    meta["研究主体"] = "个股" if is_company_mode else "行业"
+    meta["报告类型"] = report_type or "深度研究"
+    meta["分析周期"] = period or "默认近三年+最新季度"
+    meta["报告排版"] = "案例研报结构：封面→核心观点→图表与来源→正文→财务附录→风险与免责声明"
     meta["报告生成方式"] = "7-Agent 多智能体流水线 + 证据链校验"
     return meta
 
@@ -1406,10 +1411,12 @@ LEARNING_DIR = os.path.join("knowledge", "learning")
 
 # 方法库分域：把入库的学习资料按专业域组织，供各 Agent 自动调用
 METHOD_DOMAINS = {
-    "写作规范": ["行研方法论_研报模版及话术_学习笔记", "行研方法论_深度报告tips_学习笔记"],
-    "研究方法": ["行研方法论_券商行研全流程tips_学习笔记", "行研方法论_行研40问_学习笔记"],
-    "财务分析": ["行研方法论_企业财务报表分析_学习笔记", "Deloitte_Tableau停机分析_学习笔记", "Deloitte_Excel平等分类_学习笔记"],
-    "估值建模": ["Forage_JPMorgan投行_学习笔记", "Forage_Citi金融_学习笔记"],
+    "写作规范": ["行研方法论_研报模版及话术_学习笔记", "行研方法论_深度报告tips_学习笔记", "案例研报学习索引"],
+    "研究方法": ["行研方法论_券商行研全流程tips_学习笔记", "行研方法论_行研40问_学习笔记", "案例研报学习索引"],
+    "财务分析": ["行研方法论_企业财务报表分析_学习笔记", "案例_ProForma模板_学习笔记", "Deloitte_Tableau停机分析_学习笔记", "Deloitte_Excel平等分类_学习笔记"],
+    "估值建模": ["Forage_JPMorgan投行_学习笔记", "Forage_Citi金融_学习笔记", "案例_ProForma模板_学习笔记"],
+    "行业报告": ["案例研报学习索引"],
+    "个股报告": ["案例研报学习索引", "案例_ProForma模板_学习笔记"],
     "审计风控": ["Forage_KPMG审计_学习笔记"],
     "咨询分析": ["Forage_PwC咨询_学习笔记", "Forage_BCG数据科学_学习笔记"],
 }
@@ -1473,9 +1480,9 @@ def method_domain_for(research_type, purpose, report_type):
     """根据当前研究任务选择要注入的方法领域。"""
     domains = ["研究方法"]
     if research_type == "公司研究":
-        domains += ["财务分析", "估值建模"]
+        domains += ["个股报告", "财务分析", "估值建模"]
     else:
-        domains += ["财务分析"]
+        domains += ["行业报告", "财务分析"]
     if "风险" in (purpose or "") or "审计" in (purpose or ""):
         domains.append("审计风控")
     domains.append("写作规范")
@@ -1651,27 +1658,33 @@ with st.sidebar:
         research_target = st.radio("研究对象类型", ["公司", "行业"], key="research_target")
         if research_target == "公司":
             company_query = st.text_input("输入公司名称", placeholder="如：比亚迪", key="company_query")
-            period_type = st.selectbox("选择时间周期类型", ["年度", "季度"], key="period_type")
+            period_type = st.selectbox("选择报告周期", ["季度", "半年", "年度"], key="period_type")
             year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
-            if period_type == "年度":
-                period = f"{year_select}年度"
-            else:
+            if period_type == "季度":
                 quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"], key="quarter_select")
-                period = f"{year_select}年{quarter_select}"
+                period = f"{year_select}年{quarter_select}季报"
+            elif period_type == "半年":
+                half_select = st.selectbox("⚙️ 选择半年", ["H1", "H2"], key="half_select")
+                period = f"{year_select}年{half_select}半年报"
+            else:
+                period = f"{year_select}年报"
+            report_type = st.selectbox("报告类型", ["季报", "半年报", "年报", "公司深度专题"], key="report_type")
         else:
             query = st.text_input("输入行业", placeholder="如：新能源汽车", key="query")
-            period_type = st.selectbox("选择时间周期类型", ["年度", "季度", "月度"], key="period_type")
+            period_type = st.selectbox("选择报告周期", ["周度", "月度", "半年", "年度"], key="period_type")
             year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
-            if period_type == "年度":
-                period = f"{year_select}年度"
-            elif period_type == "季度":
-                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"], key="quarter_select")
-                period = f"{year_select}年{quarter_select}"
+            if period_type == "周度":
+                week_select = st.text_input("⚙️ 周次/日期范围", "第1周", key="week_select")
+                period = f"{year_select}年{week_select}周报"
+            elif period_type == "月度":
+                month_select = st.selectbox("⚙️ 选择月份", [f"{i}月" for i in range(1, 13)], key="month_select")
+                period = f"{year_select}年{month_select}月报"
+            elif period_type == "半年":
+                half_select = st.selectbox("⚙️ 选择半年", ["H1", "H2"], key="half_select")
+                period = f"{year_select}年{half_select}半年报"
             else:
-                month_select = st.selectbox("⚙️ 选择月份", ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"], key="month_select")
-                period = f"{year_select}年{month_select}"
-
-        report_type = st.selectbox("报告类型", ["年度策略", "季度跟踪", "专题研究"], key="report_type")
+                period = f"{year_select}年报"
+            report_type = st.selectbox("报告类型", ["周报", "月报", "半年报", "年报", "行业专题"], key="report_type")
         purpose = st.selectbox("研究目的", ["投资价值分析", "行业趋势分析", "财务质量分析", "风险评估"], key="purpose")
 
     submit_btn = st.button("🚀 开启 7-Agent 深度协同", key="submit_btn")
@@ -2068,6 +2081,7 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     4. 话术规范：客观审慎，避免绝对化表述；估值与预测给出假设条件；
     5. 必须引用「最新新闻与公告」与「龙头公司横向对比」两大板块（见下方实时数据）；
     6. 结尾必须给出「免责声明」。篇幅 1200-2000 字。
+    7. 版式与案例研报一致：封面/日期/主体/报告类型，核心观点先行；正文中安排行情、收入利润、业务结构、产业链或估值图表，图表标题下方写明“资料来源、报告期、数据质量”；财务附录按 Pro Forma 模板保留利润表、资产负债表、现金流量表和所有者权益变动表的口径与勾稽关系。
 
     报告必须整合以下多边对标及辩论博弈结果：
 
@@ -2119,7 +2133,8 @@ def run_research_flow(user_input, log_callback, status_callback, company_name=""
     chain_payload = icd.build_chain_payload(db_data.get("industry_name", aligned_industry))
     data_gaps = assess_data_gaps(company_name, db_data.get("industry_name", aligned_industry),
                                  is_company_mode=is_company)
-    report_meta = build_report_meta(db_data, company_data, is_company)
+    report_meta = build_report_meta(db_data, company_data, is_company,
+                                    report_type=report_type, period=period)
     as_of = db_data.get("data_as_of") or "本地库"
     _db_source_text = str(db_data.get("data_source", "") or "")
     _db_is_verified = bool(db_data.get("data_as_of")) and "估算" not in _db_source_text and "兜底" not in _db_source_text
@@ -3071,13 +3086,18 @@ with col_main:
                     leader_data=data.get("leader_data", {}),
                     news_items=data.get("news_items", []),
                 )
-                st.session_state["export_cache"] = {"docx": _doc_bytes, "pptx": _ppt_bytes}
+                _pdf_bytes = rex.export_pdf(
+                    st.session_state['current_query'],
+                    st.session_state['current_report'],
+                    _ci, evidence_data, _gap_texts, _meta, is_company_mode,
+                )
+                st.session_state["export_cache"] = {"docx": _doc_bytes, "pptx": _ppt_bytes, "pdf": _pdf_bytes}
             except Exception as _exp_err:
                 st.warning(f"文档预渲染部分失败（不影响页面）：{_exp_err}")
-                st.session_state["export_cache"] = {"docx": None, "pptx": None}
+                st.session_state["export_cache"] = {"docx": None, "pptx": None, "pdf": None}
 
         _ecache = st.session_state.get("export_cache") or {}
-        _ed1, _ed2 = st.columns(2)
+        _ed1, _ed2, _ed3 = st.columns(3)
         with _ed1:
             if _ecache.get("docx"):
                 st.download_button(
@@ -3100,6 +3120,17 @@ with col_main:
                 )
             else:
                 st.caption("PPT 导出暂不可用（依赖未就绪）")
+        with _ed3:
+            if _ecache.get("pdf"):
+                st.download_button(
+                    label="📄 下载完整研报（PDF · 案例图表版式）",
+                    data=_ecache["pdf"],
+                    file_name=f"{st.session_state['current_query']}_深度研报.pdf",
+                    mime="application/pdf",
+                    key="dl_report_pdf",
+                )
+            else:
+                st.caption("PDF 导出暂不可用（依赖未就绪）")
     else:
         # 首屏示例问题（一键填充，降低使用门槛）
         def _apply_example(ex):
