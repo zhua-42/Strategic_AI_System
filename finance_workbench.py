@@ -429,6 +429,8 @@ def workbook_bytes(bundle: Mapping[str, Any]) -> Optional[bytes]:
             "note": "无外部数据；请替换为可审计来源并填写报告期/抓取日期",
         }]))
         _write_df(writer, "Sources", sources, "Sources and Data Quality")
+        for _format in writer.book.formats:
+            _format.set_font_name("LXGW WenKai")
     output.seek(0)
     return output.getvalue()
 

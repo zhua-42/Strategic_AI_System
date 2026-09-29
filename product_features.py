@@ -129,6 +129,10 @@ def init_product_state():
                     st.session_state["current_query"] = fav.get("query", "")
                     st.session_state["current_report"] = fav.get("report", "")
                     st.session_state["current_data"] = fav.get("data", {})
+                    st.session_state["legacy_research"] = "dossier" not in fav.get("data", {})
+                    if "dossier" in fav.get("data", {}):
+                        st.session_state["autonomous_package"] = fav["data"]["dossier"]
+                        st.session_state.pop("autonomous_exports", None)
                     break
     except Exception:
         pass

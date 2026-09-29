@@ -20,3 +20,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local verification dependencies and generated test reports
+.verify-deps/
+tmp/
+output/

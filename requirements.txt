@@ -25,3 +25,7 @@ lxml>=4.9.0
 Pillow>=10.0.0
 # 保险：若云端系统 sqlite3 < 3.35（chromadb 要求 >=3.35），用 pysqlite3-binary 兜底
 pysqlite3-binary; platform_system == "Linux"
+
+# Report verification and portable Kai PDF/PPT rendering
+pypdf>=5.0.0
+pypdfium2>=4.30.0

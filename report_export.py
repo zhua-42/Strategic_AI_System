@@ -40,13 +40,13 @@ C_BORDER = "#C9CDD4"    # 表格边框
 C_HEADER_BG = "#0F2A5C" # 表头底色
 
 FONT_BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "assets", "fonts", "NotoSansSC-VF.ttf")
+                            "assets", "fonts", "LXGWWenKai-Regular.ttf")
 FONT_CANDIDATES = [
     FONT_BUNDLED,
     r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
-    "Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "WenQuanYi Zen Hei",
+    "Noto Sans CJK SC", "LXGW WenKai", "SimHei", "WenQuanYi Zen Hei",
 ]
 
 _FONT_CACHE = {"name": None, "props": None}
@@ -511,8 +511,8 @@ def export_docx(query, report_text, chart_images, evidence_data=None, gap_data=N
         section.left_margin = Inches(0.8)
         section.right_margin = Inches(0.8)
     style = doc.styles["Normal"]
-    style.font.name = "Microsoft YaHei"
-    style.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    style.font.name = "LXGW WenKai"
+    style.element.rPr.rFonts.set(qn("w:eastAsia"), "LXGW WenKai")
     style.font.size = Pt(10.5)
 
     # ---- 封面 ----
@@ -614,6 +614,8 @@ def export_docx(query, report_text, chart_images, evidence_data=None, gap_data=N
                       "内容仅供学习与研究参考，不构成任何投资建议。投资决策与风险由使用者自行承担。")
 
     bio = io.BytesIO()
+    from research_documents import apply_docx_font
+    apply_docx_font(doc)
     doc.save(bio)
     return bio.getvalue()
 
@@ -787,22 +789,22 @@ def export_pdf(query, report_text, chart_images, evidence_data=None, gap_data=No
             story.append(_table(rows, widths, header=True))
             story.append(Spacer(1, 0.15 * cm))
 
-    # Pro Forma 财务附录：字段对齐用户提供的中信证券模板。
+    # Legacy exports also receive filled, explicitly labelled financial scenarios.
+    from research_agent import proforma as build_proforma, model_visual
+    _model = (meta or {}).get("proforma") or build_proforma([], "公司" if is_company_mode else "行业")
     story.append(PageBreak())
-    story.append(_para("第四部分：Pro Forma 财务报表附录", h1))
-    story.append(_para("字段与勾稽关系参考用户提供的《中信证券通用模拟财务报表（Pro Forma）全模板》；空白金额由用户上传的财报或模型假设填入，网页不会把空白项当作真实数据。", body))
-    proforma = [
-        ("合并模拟利润表", [("营业总收入", "营业收入=上期收入×(1+增速)"), ("营业成本", "收入×(1-毛利率)"), ("营业利润", "收入-成本-税费-销售/管理/研发/财务费用"), ("净利润", "利润总额-所得税"), ("归母净利润", "净利润×归母比例"), ("EBITDA", "营业利润+折旧摊销+利息支出")]),
-        ("合并模拟资产负债表", [("货币资金", "期初现金+现金流量表净增加额"), ("应收账款", "收入÷360×DSO"), ("存货", "营业成本÷360×存货周转天数"), ("固定资产", "期初+CAPEX-折旧"), ("有息负债", "融资计划与偿债计划"), ("资产/负债权益总计", "资产总计=负债合计+所有者权益合计")]),
-        ("合并模拟现金流量表", [("净利润", "引用利润表"), ("折旧摊销/利息", "引用利润表与资产负债表"), ("营运资本变动", "期初期末应收、存货、应付差额"), ("CAPEX", "引用资本开支假设"), ("经营活动现金流", "间接法加总"), ("期末现金", "必须等于资产负债表货币资金")]),
-        ("合并模拟所有者权益变动表", [("期初权益", "引用上年期末"), ("净利润", "引用利润表归母净利润"), ("增发/回购", "引用筹资假设"), ("分红/盈余公积", "引用分红政策与净利润"), ("期末权益", "必须等于资产负债表所有者权益合计")]),
-    ]
-    for title, items in proforma:
-        story.append(_para(title, h2))
-        rows = [[_para(x, small) for x in ["项目", "基准期", "模拟期1", "模拟期2", "模拟期3", "勾稽说明"]]]
-        for item, note in items:
-            rows.append([_para(item, small), _para("待补充", small), _para("待补充", small), _para("待补充", small), _para("待补充", small), _para(note, small)])
-        story.append(_table(rows, [3.0 * cm, 2.1 * cm, 2.1 * cm, 2.1 * cm, 2.1 * cm, 4.8 * cm], header=True, font_size=7.0))
+    story.append(_para("第四部分：自动 Pro Forma 财务情景", h1))
+    story.append(_para(_model["unit"] + "；" + _model["opening_note"], body))
+    story.append(_para("来源：" + _model["base_source"] + "。要使用自动核验的公司年度收入及完整证据，请使用默认自动研究流程。", small))
+    for _idx in [14, 15, 16, 17, 22]:
+        _visual = model_visual(_idx, _model)
+        story.append(_para(_visual["title"], h2))
+        _rows = [[_para(x, small) for x in _visual["headers"]]]
+        _rows += [[_para(x, small) for x in _r] for _r in _visual["rows"]]
+        _cols = len(_visual["headers"])
+        _widths = [4.0*cm, 2.0*cm, 10.2*cm] if _cols == 3 else [4.2*cm] + [12.0*cm/(_cols-1)]*(_cols-1)
+        story.append(_table(_rows, _widths, header=True))
+        story.append(_para(_visual["source"], small))
 
     story.append(_para("第五部分：资料缺口与风险提示", h1))
     if gap_data:
@@ -850,7 +852,7 @@ def export_pptx(query, report_text, chart_images, evidence_data=None, gap_data=N
         h = hexstr.lstrip("#")
         return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
-    def _set_font(run, size=14, bold=False, color=C_SLATE, name="Microsoft YaHei"):
+    def _set_font(run, size=14, bold=False, color=C_SLATE, name="LXGW WenKai"):
         run.font.size = Pt(size)
         run.font.bold = bold
         run.font.color.rgb = _rgb(color)
@@ -1178,6 +1180,22 @@ def export_pptx(query, report_text, chart_images, evidence_data=None, gap_data=N
     _source_footer(s, "AI 生成 · 仅供参考")
 
     bio = io.BytesIO()
+    # Explicit East Asian font on all editable text, including table cells.
+    from pptx.oxml.xmlchemy import OxmlElement
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            frames = [shape.text_frame] if shape.has_text_frame else []
+            if shape.has_table:
+                frames.extend(cell.text_frame for row in shape.table.rows for cell in row.cells)
+            for frame in frames:
+                for paragraph in frame.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.name = "LXGW WenKai"
+                        props = run._r.get_or_add_rPr()
+                        for tag in ("a:ea", "a:cs"):
+                            el = OxmlElement(tag)
+                            el.set("typeface", "LXGW WenKai")
+                            props.append(el)
     prs.save(bio)
     return bio.getvalue()
 

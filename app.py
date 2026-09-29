@@ -1615,6 +1615,10 @@ with st.sidebar:
             st.session_state['current_report'] = h['content']
             st.session_state['current_data'] = h['data']
             st.session_state['current_query'] = h['query']
+            st.session_state['legacy_research'] = 'dossier' not in h['data']
+            if 'dossier' in h['data']:
+                st.session_state['autonomous_package'] = h['data']['dossier']
+                st.session_state.pop('autonomous_exports', None)
             st.rerun()
     st.divider()
     # 收藏列表（产品化：用户留存）
@@ -1628,6 +1632,10 @@ with st.sidebar:
                     st.session_state['current_query'] = _fav['query']
                     st.session_state['current_report'] = _fav['report']
                     st.session_state['current_data'] = _fav['data']
+                    st.session_state['legacy_research'] = 'dossier' not in _fav['data']
+                    if 'dossier' in _fav['data']:
+                        st.session_state['autonomous_package'] = _fav['data']['dossier']
+                        st.session_state.pop('autonomous_exports', None)
                     st.rerun()
             with _fc2:
                 if st.button("✕", key=f"fav_del_{_fi}"):
@@ -1658,46 +1666,20 @@ with st.sidebar:
     else:
         research_target = st.radio("研究对象类型", ["公司", "行业"], key="research_target")
         if research_target == "公司":
-            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪", key="company_query")
-            if st.session_state.get("period_type") not in {"季度", "半年", "年度"}:
-                st.session_state.pop("period_type", None)
-            if st.session_state.get("report_type") not in {"季报", "半年报", "年报", "公司深度专题"}:
-                st.session_state.pop("report_type", None)
-            period_type = st.selectbox("选择报告周期", ["季度", "半年", "年度"], key="period_type")
-            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
-            if period_type == "季度":
-                quarter_select = st.selectbox("⚙️ 选择季度", ["Q1", "Q2", "Q3", "Q4"], key="quarter_select")
-                period = f"{year_select}年{quarter_select}季报"
-            elif period_type == "半年":
-                half_select = st.selectbox("⚙️ 选择半年", ["H1", "H2"], key="half_select")
-                period = f"{year_select}年{half_select}半年报"
-            else:
-                period = f"{year_select}年报"
-            report_type = st.selectbox("报告类型", ["季报", "半年报", "年报", "公司深度专题"], key="report_type")
+            company_query = st.text_input("输入公司名称", placeholder="如：比亚迪 / Snowflake / NVDA", key="company_query")
+            _types = ["公司深度专题", "季报", "半年报", "年报"]
         else:
-            query = st.text_input("输入行业", placeholder="如：新能源汽车", key="query")
-            if st.session_state.get("period_type") not in {"周度", "月度", "半年", "年度"}:
-                st.session_state.pop("period_type", None)
-            if st.session_state.get("report_type") not in {"周报", "月报", "半年报", "年报", "行业专题"}:
-                st.session_state.pop("report_type", None)
-            period_type = st.selectbox("选择报告周期", ["周度", "月度", "半年", "年度"], key="period_type")
-            year_select = st.selectbox("⚙️ 选择年份", ["2021", "2022", "2023", "2024", "2025", "2026"], key="year_select")
-            if period_type == "周度":
-                week_select = st.text_input("⚙️ 周次/日期范围", "第1周", key="week_select")
-                period = f"{year_select}年{week_select}周报"
-            elif period_type == "月度":
-                month_select = st.selectbox("⚙️ 选择月份", [f"{i}月" for i in range(1, 13)], key="month_select")
-                period = f"{year_select}年{month_select}月报"
-            elif period_type == "半年":
-                half_select = st.selectbox("⚙️ 选择半年", ["H1", "H2"], key="half_select")
-                period = f"{year_select}年{half_select}半年报"
-            else:
-                period = f"{year_select}年报"
-            report_type = st.selectbox("报告类型", ["周报", "月报", "半年报", "年报", "行业专题"], key="report_type")
+            query = st.text_input("输入行业", placeholder="如：新能源汽车 / 云数据平台", key="query")
+            _types = ["行业专题", "周报", "月报", "季报", "半年报", "年报"]
+        if st.session_state.get("report_type") not in _types:
+            st.session_state.pop("report_type", None)
+        report_type = st.selectbox("报告类型", _types, key="report_type")
+        period = st.text_input("研究观察期", value="近三年及最新已披露季度", help="可输入2026年H1、2025年报、2026年9月、某周的日期范围；缺少该期间资料时会明确标注。", key="research_observation_period")
         purpose = st.selectbox("研究目的", ["投资价值分析", "行业趋势分析", "财务质量分析", "风险评估"], key="purpose")
 
-    submit_btn = st.button("🚀 开启 7-Agent 深度协同", key="submit_btn")
-    st.caption("提示：结合本地离线数据仓库及 RAG，无需网络请求，零崩溃风险，需要约1~2分钟。:D")
+    legacy_research = st.checkbox("使用原有 7-Agent 实验流程", key="legacy_research", help="保留旧流程用于对照。默认自动研究包含原文核验、完整预测三表和长报告质量检查。")
+    submit_btn = st.button("生成研究报告" if not legacy_research else "开启原有 7-Agent 流程", key="submit_btn")
+    st.caption("仅输入名称即可开始。自动联网搜集资料、逐章生成；耗时取决于资料网站与模型响应，失败可从已完成章节继续。")
 
 # --- 5. 核心 7-Agent 流水线实现 ---
 def query_understanding_agent(user_input, company_name="", period="默认近三年+最新季度", purpose="综合分析", report_type="深度研究"):
@@ -2261,6 +2243,11 @@ def update_agent_status(agent, state):
 
 # --- 9. 主面板报告与动态画图 ---
 with col_main:
+    if not legacy_research:
+        import research_ui
+        research_ui.render(client, company_query or query, "公司" if company_query else "行业",
+                           report_type, period, submitted=submit_btn,purpose=purpose)
+        st.stop()
     # 初始化 Tool Traces
     if 'tool_traces' not in st.session_state:
         st.session_state['tool_traces'] = []
